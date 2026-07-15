@@ -260,9 +260,11 @@ def _compiled_masked_step(
     temperature: float,
     capture_logprobs: bool,
     leftmost: bool,
+    threshold_mode: bool,
+    log_threshold: float,
 ) -> torch.Tensor:
-    """Compiled masked-diffusion step (low-confidence or leftmost selection,
-    absorbing state).
+    """Compiled masked-diffusion step (low-confidence, leftmost, or
+    confidence-threshold selection, absorbing state).
 
     Per denoise step: x0 over the whole canvas — greedy argmax when
     ``temperature == 0``, otherwise sampled from ``softmax(logits / T)``
@@ -272,7 +274,12 @@ def _compiled_masked_step(
     are unmasked where k follows the even transfer schedule (remaining
     masks split evenly over remaining steps). With ``leftmost``, position
     order replaces confidence order (strictly left-to-right reveal — the
-    leftmost-reveal RL rollout policy). Unmasked positions are never
+    leftmost-reveal RL rollout policy). With ``threshold_mode``, the even
+    schedule is replaced by SGLang FastDiffuser thresholding: every masked
+    position whose chosen-token logprob is >= ``log_threshold`` is unmasked,
+    plus always the single most confident one so each step makes progress
+    (worst case degrades to one-token-per-step and the ``canvas_length``
+    default step budget still terminates). Unmasked positions are never
     re-masked. A request converges when no masks remain or the step budget
     is reached; the next step commits the block (causal, writes KV) and
     resets the canvas to masks.
@@ -329,6 +336,17 @@ def _compiled_masked_step(
         # left-to-right order instead of confidence order).
         csum = torch.cumsum(mask_index.to(torch.int64), dim=-1)
         transfer = mask_index & (csum <= k.unsqueeze(1))
+    elif threshold_mode:
+        # FastDiffuser thresholding: unmask every masked position whose
+        # chosen-token logprob clears the threshold, and always the single
+        # most confident one (guaranteed progress; also covers the case
+        # where nothing clears the bar). `confidence` is -inf outside
+        # mask_index, so argmax lands on a masked position whenever one
+        # exists and both terms are automatically gated by mask_index.
+        above = confidence >= log_threshold
+        top1 = confidence.argmax(dim=-1, keepdim=True)  # [num_decode, 1]
+        force = torch.zeros_like(mask_index).scatter_(1, top1, True)
+        transfer = mask_index & (above | force)
     else:
         # Top-k per row with per-row k: rank positions by confidence (desc).
         order = torch.argsort(confidence, dim=-1, descending=True, stable=True)
@@ -502,11 +520,22 @@ class MinistralDLMModelState(ModelState):
         selection = (
             diffusion_config.selection_policy if diffusion_config else None
         ) or gen_config.get("diffusion_selection_policy") or "low_confidence"
-        if selection not in ("low_confidence", "leftmost"):
+        if selection not in ("low_confidence", "leftmost", "confidence_threshold"):
             raise ValueError(
                 f"Unknown diffusion selection_policy: {selection!r}"
             )
         self.selection_policy = selection
+        # Probability threshold for selection_policy="confidence_threshold"
+        # (SGLang FastDiffuser thresholding). None-checks rather than `or`
+        # so an explicit small value is honored.
+        threshold = (
+            diffusion_config.confidence_threshold if diffusion_config else None
+        )
+        if threshold is None:
+            threshold = gen_config.get("diffusion_confidence_threshold")
+        if threshold is None:
+            threshold = 0.9
+        self.confidence_threshold = float(threshold)
         self.diffusion_states = MinistralDLMRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
@@ -532,6 +561,7 @@ class MinistralDLMModelState(ModelState):
             diffusion_states=self.diffusion_states,
             temperature=self.sampling_temperature,
             selection_policy=self.selection_policy,
+            confidence_threshold=self.confidence_threshold,
         ), None
 
     def add_request(self, req_index: int, new_req_data: Any) -> None:
@@ -626,8 +656,10 @@ class MaskedDiffusionSampler:
     is rejected for diffusion models, so the temperature is engine-wide
     (``DiffusionConfig.temperature`` or the ``diffusion_temperature``
     generation-config key). Unmask order is ``selection_policy``:
-    ``low_confidence`` (LLaDA, default) or ``leftmost`` (strict left-to-right
-    reveal for leftmost-reveal RL rollouts).
+    ``low_confidence`` (LLaDA, default), ``leftmost`` (strict left-to-right
+    reveal for leftmost-reveal RL rollouts), or ``confidence_threshold``
+    (SGLang FastDiffuser thresholding: every position whose chosen-token
+    probability exceeds ``confidence_threshold``, at least one per step).
 
     Logprobs: the sampled token's logprob/rank (the ``logprobs=0`` path, used
     by RL rollouts) are captured at the denoise step each position was
@@ -647,6 +679,7 @@ class MaskedDiffusionSampler:
         diffusion_states: MinistralDLMRequestStates,
         temperature: float = 0.0,
         selection_policy: str = "low_confidence",
+        confidence_threshold: float = 0.9,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
@@ -656,6 +689,9 @@ class MaskedDiffusionSampler:
         self.mask_token_id = diffusion_states.mask_token_id
         self.temperature = temperature
         self.leftmost = selection_policy == "leftmost"
+        self.threshold_mode = selection_policy == "confidence_threshold"
+        # Compared against per-position chosen-token logprobs (natural log).
+        self.log_threshold = math.log(confidence_threshold)
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
@@ -864,6 +900,8 @@ class MaskedDiffusionSampler:
             temperature=self.temperature,
             capture_logprobs=max_num_logprobs >= 0,
             leftmost=self.leftmost,
+            threshold_mode=self.threshold_mode,
+            log_threshold=self.log_threshold,
         )
 
         # Top-k introspection (logprobs>0): stash the converged denoise

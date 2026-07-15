@@ -34,10 +34,23 @@ class DiffusionConfig:
     (model-specific key, e.g. ``diffusion_temperature``), defaulting to
     greedy for masked-diffusion models."""
 
-    selection_policy: Literal["low_confidence", "leftmost"] | None = None
+    selection_policy: (
+        Literal["low_confidence", "leftmost", "confidence_threshold"] | None
+    ) = None
     """Which masked positions to unmask each denoising step (masked-diffusion
-    models). ``low_confidence``: the most confident predictions first (LLaDA).
+    models). ``low_confidence``: the most confident predictions first (LLaDA),
+    top-k per step with k from the even transfer schedule.
     ``leftmost``: strictly left-to-right — with one token per step this yields
     clean per-token policy logprobs matching a leftmost-reveal RL recompute.
+    ``confidence_threshold``: unmask every position whose chosen-token
+    probability exceeds ``confidence_threshold`` (always at least the single
+    most confident one, so each step makes progress) — the SGLang
+    FastDiffuser thresholding decode.
     If not set, read from the model's generation_config.json
     (``diffusion_selection_policy``), defaulting to ``low_confidence``."""
+
+    confidence_threshold: float | None = Field(default=None, gt=0, lt=1)
+    """Probability threshold for ``selection_policy="confidence_threshold"``.
+    If not set, read from the model's generation_config.json
+    (``diffusion_confidence_threshold``), defaulting to 0.9. Ignored by the
+    other selection policies."""
