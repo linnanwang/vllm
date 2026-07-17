@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Config for Nemotron Ministral-based masked block-diffusion LMs.
 
-The HF checkpoint ships a trust-remote-code ``MinistralDLMConfig`` that does
+The HF checkpoint ships a trust-remote-code ``NemotronLabsDiffusionConfig`` that does
 not expose ``canvas_length``, which vLLM uses to detect diffusion models
 (``ModelConfig.is_diffusion``). This local config mirrors the Ministral
 backbone fields and derives ``canvas_length`` from ``block_size``.
@@ -13,8 +13,8 @@ from typing import Any
 from transformers import PretrainedConfig
 
 
-class MinistralDLMConfig(PretrainedConfig):
-    model_type = "ministral_dlm"
+class NemotronLabsDiffusionConfig(PretrainedConfig):
+    model_type = "nemotron_labs_diffusion"
 
     def __init__(
         self,

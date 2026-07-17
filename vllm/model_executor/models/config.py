@@ -314,7 +314,7 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
             )
 
 
-class MinistralDLMForBlockDiffusionConfig(VerifyAndUpdateConfig):
+class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Set up the diffusion config and defaults for the Nemotron
@@ -911,7 +911,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "MambaForCausalLM": MambaModelConfig,
-    "MinistralDiffEncoderModel": MinistralDLMForBlockDiffusionConfig,
+    "NemotronLabsDiffusionModel": NemotronLabsDiffusionForBlockDiffusionConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,

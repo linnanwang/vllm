@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the Nemotron Ministral masked block-diffusion LM
-(``MinistralDiffEncoderModel`` / ``nemotron_dllm``).
+(``NemotronLabsDiffusionModel`` / ``nemotron_dllm``).
 
 Tiers:
 
@@ -52,9 +52,9 @@ requires_gpu = pytest.mark.skipif(
 # CPU-only: registration & diffusion detection
 # ---------------------------------------------------------------------------
 def test_config_registration():
-    from vllm.transformers_utils.configs import MinistralDLMConfig
+    from vllm.transformers_utils.configs import NemotronLabsDiffusionConfig
 
-    cfg = MinistralDLMConfig(block_size=32, mask_token_id=100)
+    cfg = NemotronLabsDiffusionConfig(block_size=32, mask_token_id=100)
     # canvas_length is the field ModelConfig.is_diffusion keys off of.
     assert cfg.canvas_length == 32
     assert cfg.mask_token_id == 100
@@ -63,7 +63,7 @@ def test_config_registration():
 def test_arch_in_model_registry():
     from vllm.model_executor.models.registry import ModelRegistry
 
-    assert "MinistralDiffEncoderModel" in ModelRegistry.get_supported_archs()
+    assert "NemotronLabsDiffusionModel" in ModelRegistry.get_supported_archs()
 
 
 def test_diffusion_config_temperature():

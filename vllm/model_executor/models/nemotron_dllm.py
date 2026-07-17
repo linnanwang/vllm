@@ -71,7 +71,7 @@ def _hf_yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-class MinistralDLMAttention(LlamaAttention):
+class NemotronLabsDiffusionAttention(LlamaAttention):
     """Llama attention + YaRN RoPE (HF attention factor) + per-token
     llama-4 Q scaling applied after RoPE."""
 
@@ -137,7 +137,7 @@ class MinistralDLMAttention(LlamaAttention):
         return output
 
 
-class MinistralDLMDecoderLayer(LlamaDecoderLayer):
+class NemotronLabsDiffusionDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -148,17 +148,17 @@ class MinistralDLMDecoderLayer(LlamaDecoderLayer):
             vllm_config,
             prefix=prefix,
             config=config,
-            attn_layer_type=MinistralDLMAttention,
+            attn_layer_type=NemotronLabsDiffusionAttention,
         )
 
 
-class MinistralDLMForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
+class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
     """Ministral masked block-diffusion LM for vLLM.
 
     The backbone is a stock ``LlamaModel`` with Ministral parameters; the
     only architectural deltas live in the attention layer (YaRN factor and
     llama-4 Q scale). Mixed causal/bidirectional attention is driven by
-    ``MinistralDLMModelState.prepare_attn`` via a per-request causal tensor.
+    ``NemotronLabsDiffusionModelState.prepare_attn`` via a per-request causal tensor.
     """
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -174,7 +174,7 @@ class MinistralDLMForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
 
     @staticmethod
     def get_model_state_cls():
-        return MinistralDLMModelState
+        return NemotronLabsDiffusionModelState
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -185,7 +185,7 @@ class MinistralDLMForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
         self.model = LlamaModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
-            layer_type=MinistralDLMDecoderLayer,
+            layer_type=NemotronLabsDiffusionDecoderLayer,
         )
         # The LM head is named diffusion_head in the checkpoint and is NOT
         # tied to the embeddings.
@@ -423,7 +423,7 @@ def _compiled_masked_step(
     return logits_3d
 
 
-class MinistralDLMRequestStates:
+class NemotronLabsDiffusionRequestStates:
     """Pre-allocated GPU tensors for per-request masked-diffusion state."""
 
     def __init__(
@@ -477,7 +477,7 @@ class MinistralDLMRequestStates:
         self.is_encoder_phase[slot_idx] = False
 
 
-class MinistralDLMModelState(ModelState):
+class NemotronLabsDiffusionModelState(ModelState):
     """ModelState for the Ministral masked block-diffusion LM.
 
     Single backbone in two modes:
@@ -536,7 +536,7 @@ class MinistralDLMModelState(ModelState):
         if threshold is None:
             threshold = 0.9
         self.confidence_threshold = float(threshold)
-        self.diffusion_states = MinistralDLMRequestStates(
+        self.diffusion_states = NemotronLabsDiffusionRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
             mask_token_id=getattr(hf_config, "mask_token_id", 100),
@@ -676,7 +676,7 @@ class MaskedDiffusionSampler:
         self,
         sampler: Any,
         vocab_size: int,
-        diffusion_states: MinistralDLMRequestStates,
+        diffusion_states: NemotronLabsDiffusionRequestStates,
         temperature: float = 0.0,
         selection_policy: str = "low_confidence",
         confidence_threshold: float = 0.9,
