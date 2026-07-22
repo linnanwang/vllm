@@ -249,6 +249,7 @@ def _compiled_masked_step(
     is_encoder_phase: torch.Tensor,  # [max_num_reqs]
     unmask_logprobs: torch.Tensor,  # [max_num_reqs, CL] fp32
     unmask_ranks: torch.Tensor,  # [max_num_reqs, CL] int32
+    unmask_entropy: torch.Tensor,  # [max_num_reqs, CL] fp32
     # Output tensors (modified in-place)
     sampled: torch.Tensor,  # [num_reqs, CL]
     num_sampled: torch.Tensor,  # [num_reqs]
@@ -259,6 +260,7 @@ def _compiled_masked_step(
     CL: int,
     temperature: float,
     capture_logprobs: bool,
+    capture_entropy: bool,
     leftmost: bool,
     threshold_mode: bool,
     log_threshold: float,
@@ -289,6 +291,10 @@ def _compiled_masked_step(
     into ``unmask_logprobs``/``unmask_ranks`` at the step each position is
     unmasked, so the logprobs emitted at commit reflect the distribution
     each token was actually sampled from (not the final denoise step's).
+    With ``capture_entropy`` (requires ``capture_logprobs``), the entropy
+    ``H = -sum_v p_v log p_v`` of that same at-unmask sampling distribution
+    is written into ``unmask_entropy`` (the DiffusionConfig.return_entropy
+    channel, consumed by the JustGRPO-Fast trainer).
 
     Returns the fp32 logits ``[num_decode, CL, vocab]`` so the caller can
     compute top-k logprobs outside the compiled region.
@@ -373,6 +379,13 @@ def _compiled_masked_step(
         unmask_ranks[decode_slots] = torch.where(
             write, chosen_rank, unmask_ranks[decode_slots]
         )
+        if capture_entropy:
+            # Entropy of the same at-unmask sampling distribution the
+            # chosen token's logprob is scored under.
+            token_entropy = -(sample_lp.exp() * sample_lp).sum(dim=-1)
+            unmask_entropy[decode_slots] = torch.where(
+                write, token_entropy, unmask_entropy[decode_slots]
+            )
 
     # ---- Absorbing-state update (denoise rows only) ----
     new_canvas = torch.where(transfer & is_denoise.unsqueeze(1), x0, cur_canvas)
@@ -461,6 +474,11 @@ class NemotronLabsDiffusionRequestStates:
         self.unmask_ranks = torch.zeros(
             max_num_reqs, canvas_length, dtype=torch.int32, device=device
         )
+        # Per-position entropy of the at-unmask sampling distribution;
+        # populated only when the sampler runs with return_entropy.
+        self.unmask_entropy = torch.zeros(
+            max_num_reqs, canvas_length, dtype=torch.float32, device=device
+        )
 
     def init_canvas(self, slot_indices) -> None:
         """Reset the canvas to all-mask for the given slots."""
@@ -472,6 +490,7 @@ class NemotronLabsDiffusionRequestStates:
         self.step[slot_idx] = 0
         self.unmask_logprobs[slot_idx] = 0.0
         self.unmask_ranks[slot_idx] = 0
+        self.unmask_entropy[slot_idx] = 0.0
 
     def remove_request(self, slot_idx: int) -> None:
         self.is_encoder_phase[slot_idx] = False
@@ -536,6 +555,15 @@ class NemotronLabsDiffusionModelState(ModelState):
         if threshold is None:
             threshold = 0.9
         self.confidence_threshold = float(threshold)
+        # Opt-in per-token entropy channel (JustGRPO-Fast): emitted through
+        # the sample-logprobs output as a second column keyed by
+        # mask_token_id; requests must ask for logprobs>=1 to receive it.
+        return_entropy = (
+            diffusion_config.return_entropy if diffusion_config else None
+        )
+        if return_entropy is None:
+            return_entropy = gen_config.get("diffusion_return_entropy")
+        self.return_entropy = bool(return_entropy)
         self.diffusion_states = NemotronLabsDiffusionRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
@@ -562,6 +590,7 @@ class NemotronLabsDiffusionModelState(ModelState):
             temperature=self.sampling_temperature,
             selection_policy=self.selection_policy,
             confidence_threshold=self.confidence_threshold,
+            return_entropy=self.return_entropy,
         ), None
 
     def add_request(self, req_index: int, new_req_data: Any) -> None:
@@ -661,6 +690,12 @@ class MaskedDiffusionSampler:
     (SGLang FastDiffuser thresholding: every position whose chosen-token
     probability exceeds ``confidence_threshold``, at least one per step).
 
+    With ``return_entropy`` (``DiffusionConfig.return_entropy`` or the
+    ``diffusion_return_entropy`` generation-config key), commits emit the
+    at-unmask entropy of each token's sampling distribution as a second
+    logprob column keyed by ``mask_token_id``; this replaces top-k logprob
+    introspection while enabled and requires requests to set ``logprobs>=1``.
+
     Logprobs: the sampled token's logprob/rank (the ``logprobs=0`` path, used
     by RL rollouts) are captured at the denoise step each position was
     unmasked, i.e. under the distribution the token was actually sampled
@@ -680,6 +715,7 @@ class MaskedDiffusionSampler:
         temperature: float = 0.0,
         selection_policy: str = "low_confidence",
         confidence_threshold: float = 0.9,
+        return_entropy: bool = False,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
@@ -692,6 +728,9 @@ class MaskedDiffusionSampler:
         self.threshold_mode = selection_policy == "confidence_threshold"
         # Compared against per-position chosen-token logprobs (natural log).
         self.log_threshold = math.log(confidence_threshold)
+        # Emit at-unmask entropy as a second logprob column keyed by
+        # mask_token_id (replaces top-k introspection while enabled).
+        self.return_entropy = return_entropy
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
@@ -889,6 +928,7 @@ class MaskedDiffusionSampler:
             states.is_encoder_phase,
             states.unmask_logprobs,
             states.unmask_ranks,
+            states.unmask_entropy,
             # Output
             sampled,
             num_sampled,
@@ -899,6 +939,7 @@ class MaskedDiffusionSampler:
             CL=CL,
             temperature=self.temperature,
             capture_logprobs=max_num_logprobs >= 0,
+            capture_entropy=self.return_entropy and max_num_logprobs >= 0,
             leftmost=self.leftmost,
             threshold_mode=self.threshold_mode,
             log_threshold=self.log_threshold,
@@ -907,8 +948,9 @@ class MaskedDiffusionSampler:
         # Top-k introspection (logprobs>0): stash the converged denoise
         # step's top-k (is_encoder_phase flipped False->True); attached on
         # the commit. The logprobs==0 path reads the at-unmask buffers
-        # instead and needs no stash.
-        if max_num_logprobs > 0 and num_decode > 0:
+        # instead and needs no stash. return_entropy replaces top-k
+        # introspection entirely (the extra column carries entropy).
+        if max_num_logprobs > 0 and not self.return_entropy and num_decode > 0:
             converged_mask = states.is_encoder_phase[decode_slots]
             just_converged = converged_mask & ~is_committing
             if just_converged.any():
@@ -945,7 +987,33 @@ class MaskedDiffusionSampler:
                     continue
                 slot = int(slots_np[i])
                 k_i = int(valid_canvas_len_np[li])
-                if max_num_logprobs > 0:
+                if self.return_entropy:
+                    # Entropy mode (JustGRPO-Fast): two columns per token —
+                    # col 0 is the sampled token's at-unmask logprob, col 1
+                    # carries the at-unmask entropy keyed by mask_token_id
+                    # (never a committed token, so the key cannot collide).
+                    # Requests need logprobs>=1 for the extra column to
+                    # survive per-request truncation in the logprobs
+                    # processor downstream.
+                    ids = sampled[i, :k_i].to(torch.int64)
+                    parts_ids.append(
+                        torch.stack(
+                            [ids, torch.full_like(ids, self.mask_token_id)],
+                            dim=-1,
+                        )
+                    )
+                    parts_lp.append(
+                        torch.stack(
+                            [
+                                states.unmask_logprobs[slot, :k_i],
+                                states.unmask_entropy[slot, :k_i],
+                            ],
+                            dim=-1,
+                        )
+                    )
+                    parts_ranks.append(states.unmask_ranks[slot, :k_i])
+                    flat_offset += k_i
+                elif max_num_logprobs > 0:
                     lp = self._pending_logprobs.pop(slot, None)
                     if lp is None:
                         continue

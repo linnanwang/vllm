@@ -54,3 +54,15 @@ class DiffusionConfig:
     If not set, read from the model's generation_config.json
     (``diffusion_confidence_threshold``), defaulting to 0.9. Ignored by the
     other selection policies."""
+
+    return_entropy: bool | None = None
+    """Emit per-token entropy ``H = -sum_v p_v log p_v`` of the sampling
+    distribution, captured at the denoise step each token was unmasked
+    (masked-diffusion models) — the same distribution the token's logprob is
+    scored under. The entropy rides the sample-logprobs channel as an extra
+    logprob column keyed by the mask token id (which is never a committed
+    token), so requests must set ``logprobs>=1`` to receive it; while enabled
+    it replaces top-k logprob introspection. Consumed by the
+    entropy-sparsified JustGRPO-Fast trainer. If not set, read from the
+    model's generation_config.json (``diffusion_return_entropy``),
+    defaulting to off."""

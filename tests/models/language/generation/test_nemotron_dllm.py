@@ -99,6 +99,7 @@ def test_masked_step_sampling_semantics():
             "phase": torch.zeros(MAX_REQS, dtype=torch.bool, device=device),
             "lp": torch.zeros(MAX_REQS, CL, dtype=torch.float32, device=device),
             "rk": torch.zeros(MAX_REQS, CL, dtype=torch.int32, device=device),
+            "ent": torch.zeros(MAX_REQS, CL, dtype=torch.float32, device=device),
         }
 
     def run_step(st, logits, temperature, leftmost=False, steps=max_steps,
@@ -115,9 +116,11 @@ def test_masked_step_sampling_semantics():
             torch.full((1,), CL, dtype=torch.int64, device=device),
             torch.full((1,), req_temp, dtype=torch.float32, device=device),
             st["canvas"], st["step"], st["phase"], st["lp"], st["rk"],
+            st["ent"],
             sampled, num_sampled, draft,
             max_denoising_steps=steps, mask_token_id=mask_id, CL=CL,
             temperature=temperature, capture_logprobs=True,
+            capture_entropy=True,
             leftmost=leftmost,
         )
 
@@ -137,20 +140,27 @@ def test_masked_step_sampling_semantics():
     want = lp1.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
     assert torch.allclose(st["lp"][0][step1], want[step1], atol=1e-5)
     assert (st["rk"][0][step1] == 1).all()
+    # At-unmask entropy: H = -sum p log p of the same step-1 distribution.
+    want_ent = -(lp1.exp() * lp1).sum(-1)
+    assert torch.allclose(st["ent"][0][step1], want_ent[step1], atol=1e-5)
 
     # At-unmask persistence: a second step with DIFFERENT logits must not
     # rewrite the step-1 captures, and step-2 captures reflect step-2 logits.
     lp_after1 = st["lp"][0].clone()
+    ent_after1 = st["ent"][0].clone()
     torch.manual_seed(1)
     logits2 = torch.randn(1, CL, V, device=device) * 4.0
     logits2[..., mask_id] = -100.0
     run_step(st, logits2, 0.0)
     assert not (st["canvas"][0] == mask_id).any()
     assert torch.allclose(st["lp"][0][step1], lp_after1[step1])
+    assert torch.allclose(st["ent"][0][step1], ent_after1[step1])
     step2 = ~step1
     lp2 = logits2[0].float().log_softmax(-1)
     want2 = lp2.gather(-1, st["canvas"][0].unsqueeze(-1)).squeeze(-1)
     assert torch.allclose(st["lp"][0][step2], want2[step2], atol=1e-5)
+    want2_ent = -(lp2.exp() * lp2).sum(-1)
+    assert torch.allclose(st["ent"][0][step2], want2_ent[step2], atol=1e-5)
 
     # Sampling (T=1): draws differ across seeds; the captured logprob/rank
     # match the SAMPLED token under this step's distribution.
@@ -166,6 +176,9 @@ def test_masked_step_sampling_semantics():
         assert torch.allclose(st["lp"][0][unm], got[unm], atol=1e-5)
         ranks = (lp_ref >= got.unsqueeze(-1)).sum(-1).int()
         assert torch.equal(st["rk"][0][unm], ranks[unm])
+        # Entropy of the same sampling distribution (T=1: untempered).
+        ent_ref = -(lp_ref.exp() * lp_ref).sum(-1)
+        assert torch.allclose(st["ent"][0][unm], ent_ref[unm], atol=1e-5)
         draws.append(tuple(toks[unm].tolist()))
     assert len(set(draws)) >= 2, f"3 seeds gave identical draws: {draws}"
 
@@ -413,3 +426,55 @@ def test_stochastic_rollouts(monkeypatch):
         for tid, entry in zip(c.token_ids, c.logprobs):
             lp = entry[tid]
             assert lp.logprob <= 1e-6 and lp.rank >= 1
+
+
+# ---------------------------------------------------------------------------
+# GPU + weights: return_entropy channel (JustGRPO-Fast rollout contract)
+# ---------------------------------------------------------------------------
+@requires_gpu
+@requires_weights
+def test_return_entropy_channel(monkeypatch):
+    """diffusion_config return_entropy=True + logprobs=1 -> every generated
+    token's logprob entry carries a second column keyed by the mask token id
+    whose value is the at-unmask entropy (finite, in [0, log V])."""
+    import math
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm import LLM, SamplingParams
+
+    tok, _ = _load_hf(device="cpu")
+    msgs = [{"role": "user", "content": "Tell me a short story about a robot."}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    prompt_ids = enc["input_ids"] if not isinstance(enc, list) else enc
+
+    llm = LLM(
+        model=MODEL_PATH,
+        trust_remote_code=True,
+        enforce_eager=True,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=0.6,
+        diffusion_config={
+            "temperature": 1.0,
+            "selection_policy": "leftmost",
+            "return_entropy": True,
+        },
+    )
+    vocab_size = llm.llm_engine.model_config.get_vocab_size()
+    outs = llm.generate(
+        [{"prompt_token_ids": list(prompt_ids)}] * 2,
+        SamplingParams(temperature=1.0, max_tokens=2 * CANVAS_LENGTH, logprobs=1),
+    )
+    saw_positive_entropy = False
+    for o in outs:
+        c = o.outputs[0]
+        assert c.logprobs is not None and len(c.logprobs) == len(c.token_ids)
+        for tid, entry in zip(c.token_ids, c.logprobs):
+            assert tid != MASK_TOKEN_ID  # commits never emit the mask token
+            assert entry[tid].logprob <= 1e-6
+            assert MASK_TOKEN_ID in entry, (
+                f"missing entropy column: {list(entry.keys())}"
+            )
+            ent = entry[MASK_TOKEN_ID].logprob
+            assert 0.0 <= ent <= math.log(vocab_size) + 1e-4, ent
+            saw_positive_entropy = saw_positive_entropy or ent > 1e-3
+    assert saw_positive_entropy, "all entropies ~0 at temperature 1.0"
