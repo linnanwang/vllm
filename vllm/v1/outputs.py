@@ -280,6 +280,12 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # Per-request block-relative denoising step that revealed each sampled
+    # token, trimmed to the same lengths as ``sampled_token_ids``. Only set by
+    # masked-diffusion models running with ``DiffusionConfig.return_reveal_steps``;
+    # ``None`` otherwise.
+    reveal_steps: list[list[int]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

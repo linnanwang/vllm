@@ -112,6 +112,11 @@ class Scheduler(SchedulerInterface):
             else self.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        # Masked-diffusion emit_full_blocks: keep the remainder of the block a
+        # stop token landed in, instead of trimming the output at that token.
+        _diff_cfg = getattr(vllm_config, "diffusion_config", None)
+        _efb = getattr(_diff_cfg, "emit_full_blocks", None) if _diff_cfg else None
+        self.diffusion_emit_full_blocks = bool(_efb)
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -1506,6 +1511,8 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
+        # Masked-diffusion reveal steps, index-aligned with sampled_token_ids.
+        reveal_steps_all = model_runner_output.reveal_steps
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -1667,6 +1674,13 @@ class Scheduler(SchedulerInterface):
                     request.resumable = False
                     stopped = True
 
+            # Reveal steps are emitted 1:1 with the sampled tokens, and the
+            # stop check only ever truncates new_token_ids from the end, so a
+            # prefix slice keeps them aligned.
+            reveal_steps = None
+            if reveal_steps_all is not None and new_token_ids:
+                reveal_steps = reveal_steps_all[req_index][: len(new_token_ids)]
+
             routed_experts = None
             if (
                 self.enable_return_routed_experts
@@ -1755,6 +1769,7 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
+                        reveal_steps=reveal_steps,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
@@ -1914,7 +1929,29 @@ class Scheduler(SchedulerInterface):
             # This must be called before we make the EngineCoreOutput.
             stopped = check_stop(request, self.max_model_len)
             if stopped:
-                del new_token_ids[num_new:]  # Trim new tokens if needed.
+                if (
+                    self.diffusion_emit_full_blocks
+                    and request.status == RequestStatus.FINISHED_STOPPED
+                ):
+                    # emit_full_blocks: one masked-diffusion engine step commits
+                    # a whole block, and under out-of-order reveal the stop
+                    # token can be committed BEFORE positions revealed earlier
+                    # in the trajectory. Trimming here would drop those tokens
+                    # and desync the logprob / reveal-step channels, which are
+                    # sliced to len(new_token_ids). Keep the rest of the block,
+                    # but never past the length limits (a length-capped stop
+                    # takes the normal trim, since status is not
+                    # FINISHED_STOPPED).
+                    budget = min(
+                        self.max_model_len - request.num_tokens,
+                        request.max_tokens - request.num_output_tokens,
+                    )
+                    extra = new_token_ids[num_new : num_new + max(budget, 0)]
+                    for extra_token_id in extra:
+                        request.append_output_token_ids(extra_token_id)
+                    del new_token_ids[num_new + len(extra) :]
+                else:
+                    del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
         return new_token_ids, stopped
 

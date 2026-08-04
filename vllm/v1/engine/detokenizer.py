@@ -80,6 +80,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.stop = params.stop
         self.min_tokens = params.min_tokens
         self.include_stop_str_in_output = params.include_stop_str_in_output
+        # Token ids that terminate a request. Used to verify that a
+        # stop-terminated chunk really does END with the stop token before
+        # skipping it: masked-diffusion models with
+        # DiffusionConfig.emit_full_blocks keep the rest of the block the stop
+        # token landed in, so the stop token can sit mid-chunk with real
+        # tokens after it.
+        self._stop_token_ids: set[int] = set(params.stop_token_ids or ())
+        if params.eos_token_id is not None:
+            self._stop_token_ids.add(params.eos_token_id)
 
         # Number of chars to hold back when stop strings are to be excluded
         # from streamed output.
@@ -104,9 +113,19 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             # Skip detokenization if no new token ids.
             return None
 
-        if stop_terminated and not self.include_stop_str_in_output:
+        if (
+            stop_terminated
+            and not self.include_stop_str_in_output
+            and new_token_ids[-1] in self._stop_token_ids
+        ):
             # If stop-terminated, exclude last token from detokenization
             # based on include_stop_str_in_output parameter.
+            # The membership check keeps this correct when the stop token is
+            # NOT last -- emit_full_blocks keeps the tokens committed after it
+            # in the same block. Without it, the block's final token would be
+            # dropped from the text and the stop token's text kept instead.
+            # In the ordinary case the last token IS the stop token, so this
+            # is behavior-preserving.
             skipped_stop_token_id = new_token_ids[-1]
             new_token_ids = new_token_ids[:-1]
         else:

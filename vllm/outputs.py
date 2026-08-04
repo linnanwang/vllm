@@ -35,6 +35,10 @@ class CompletionOutput:
             to stop, None if the completion finished for some other reason
             including encountering the EOS token.
         lora_request: The LoRA request that was used to generate the output.
+        reveal_steps: For masked-diffusion (dLLM) models run with
+            ``DiffusionConfig.return_reveal_steps``, the block-relative
+            denoising step that revealed each token, parallel to
+            ``token_ids``. None for every other model and configuration.
     """
 
     index: int
@@ -43,6 +47,7 @@ class CompletionOutput:
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    reveal_steps: list[int] | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
@@ -56,6 +61,7 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
+            f"reveal_steps={self.reveal_steps}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "

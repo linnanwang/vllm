@@ -35,13 +35,19 @@ class DiffusionConfig:
     greedy for masked-diffusion models."""
 
     selection_policy: (
-        Literal["low_confidence", "leftmost", "confidence_threshold"] | None
+        Literal["low_confidence", "leftmost", "confidence_threshold", "random"]
+        | None
     ) = None
     """Which masked positions to unmask each denoising step (masked-diffusion
     models). ``low_confidence``: the most confident predictions first (LLaDA),
     top-k per step with k from the even transfer schedule.
     ``leftmost``: strictly left-to-right — with one token per step this yields
     clean per-token policy logprobs matching a leftmost-reveal RL recompute.
+    ``random``: uniform random reveal order among the still-masked positions,
+    with k from the even transfer schedule. The choice is independent of the
+    model's scores, so each committed token's recorded logprob is an unbiased
+    policy logprob (unlike confidence selection) -- the SGLang FastDiffuser
+    ``random`` decode, used by the trajectory-replay baselines.
     ``confidence_threshold``: unmask every position whose chosen-token
     probability exceeds ``confidence_threshold`` (always at least the single
     most confident one, so each step makes progress) — the SGLang
@@ -65,4 +71,36 @@ class DiffusionConfig:
     it replaces top-k logprob introspection. Consumed by the
     entropy-sparsified JustGRPO-Fast trainer. If not set, read from the
     model's generation_config.json (``diffusion_return_entropy``),
+    defaulting to off."""
+
+    return_reveal_steps: bool | None = None
+    """Emit the block-relative denoising step that revealed each generated
+    token (masked-diffusion models), so a trainer can replay the decoding
+    trajectory and score every token on exactly the context inference
+    conditioned on. Surfaced as ``CompletionOutput.reveal_steps``, a plain
+    ``list[int]`` parallel to ``token_ids`` -- the structural twin of the
+    SGLang fork's ``meta_info["output_token_reveal_steps"]``. Steps are
+    0-based and reset at each block commit. Independent of ``logprobs``:
+    the channel does not ride the logprobs output, so requests need not ask
+    for logprobs to receive it. Consumed by the inference-trajectory-replay
+    ("Trace" / Amortized GRPO) trainer. If not set, read from the model's
+    generation_config.json (``diffusion_return_reveal_steps``), defaulting
+    to off."""
+
+    emit_full_blocks: bool | None = None
+    """Keep the whole final block when a request stops on a stop token,
+    instead of trimming the output at that token (masked-diffusion models).
+
+    One engine step commits an entire block at once, and under out-of-order
+    reveal (``random`` / confidence selection) the stop token can be committed
+    before positions that were revealed EARLIER in the trajectory. The default
+    trim would silently drop those tokens, leaving a trajectory consumer with
+    a reveal-step sequence that is missing its own history. Enabling this
+    extends the token ids, the logprobs and the reveal steps consistently,
+    since all three are sliced to the same length downstream.
+
+    Only stop-token stops are extended; a length-capped stop is never pushed
+    past ``max_model_len`` / ``max_tokens``. This is the vLLM port of the
+    SGLang FastDiffuser ``emit_full_blocks`` option. If not set, read from the
+    model's generation_config.json (``diffusion_emit_full_blocks``),
     defaulting to off."""

@@ -250,10 +250,12 @@ def _compiled_masked_step(
     unmask_logprobs: torch.Tensor,  # [max_num_reqs, CL] fp32
     unmask_ranks: torch.Tensor,  # [max_num_reqs, CL] int32
     unmask_entropy: torch.Tensor,  # [max_num_reqs, CL] fp32
+    unmask_step: torch.Tensor,  # [max_num_reqs, CL] int32
     # Output tensors (modified in-place)
     sampled: torch.Tensor,  # [num_reqs, CL]
     num_sampled: torch.Tensor,  # [num_reqs]
     draft_tokens: torch.Tensor,  # [max_num_reqs, >=CL]
+    reveal_steps: torch.Tensor,  # [num_reqs, CL] int32
     # Scalar config
     max_denoising_steps: int,
     mask_token_id: int,
@@ -261,6 +263,7 @@ def _compiled_masked_step(
     temperature: float,
     capture_logprobs: bool,
     capture_entropy: bool,
+    capture_steps: bool,
     leftmost: bool,
     threshold_mode: bool,
     log_threshold: float,
@@ -295,6 +298,11 @@ def _compiled_masked_step(
     ``H = -sum_v p_v log p_v`` of that same at-unmask sampling distribution
     is written into ``unmask_entropy`` (the DiffusionConfig.return_entropy
     channel, consumed by the JustGRPO-Fast trainer).
+    With ``capture_steps`` (independent of ``capture_logprobs``), the
+    block-relative denoise step that unmasked each position is written into
+    ``unmask_step`` and emitted through ``reveal_steps`` on the commit step
+    (the DiffusionConfig.return_reveal_steps channel, consumed by the
+    trajectory-replay "Trace" trainer).
 
     Returns the fp32 logits ``[num_decode, CL, vocab]`` so the caller can
     compute top-k logprobs outside the compiled region.
@@ -387,6 +395,21 @@ def _compiled_masked_step(
                 write, token_entropy, unmask_entropy[decode_slots]
             )
 
+    # ---- At-unmask reveal-step capture (block-relative denoise step) ----
+    # Deliberately outside the ``capture_logprobs`` block: the reveal-step
+    # channel does not ride the logprobs output, so it must work at
+    # ``logprobs=0`` and when logprobs are off entirely. ``cur_step`` is the
+    # pre-increment counter, which resets to 0 at every commit, so the
+    # recorded value is block-relative and 0-based -- the same convention as
+    # the SGLang fork's ``commit_step``.
+    if capture_steps:
+        step_write = transfer & is_denoise.unsqueeze(1)
+        unmask_step[decode_slots] = torch.where(
+            step_write,
+            cur_step.to(unmask_step.dtype).unsqueeze(1),
+            unmask_step[decode_slots],
+        )
+
     # ---- Absorbing-state update (denoise rows only) ----
     new_canvas = torch.where(transfer & is_denoise.unsqueeze(1), x0, cur_canvas)
 
@@ -421,6 +444,12 @@ def _compiled_masked_step(
     num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * emit_len.to(
         num_sampled.dtype
     )
+    if capture_steps:
+        # Parallel to ``sampled``, emitted on the commit step only. Trimmed to
+        # ``num_sampled`` downstream, exactly like ``sampled_token_ids``.
+        reveal_steps[decode_idx] = unmask_step[decode_slots].to(
+            reveal_steps.dtype
+        ) * is_commit.unsqueeze(1).to(reveal_steps.dtype)
 
     # ---- Convergence: no masks remain, or step budget exhausted ----
     masks_left = ((new_canvas == mask_token_id) & valid).sum(dim=-1)
@@ -479,6 +508,12 @@ class NemotronLabsDiffusionRequestStates:
         self.unmask_entropy = torch.zeros(
             max_num_reqs, canvas_length, dtype=torch.float32, device=device
         )
+        # Per-position block-relative denoise step at which the position was
+        # unmasked; populated only when the sampler runs with
+        # return_reveal_steps.
+        self.unmask_step = torch.zeros(
+            max_num_reqs, canvas_length, dtype=torch.int32, device=device
+        )
 
     def init_canvas(self, slot_indices) -> None:
         """Reset the canvas to all-mask for the given slots."""
@@ -491,6 +526,7 @@ class NemotronLabsDiffusionRequestStates:
         self.unmask_logprobs[slot_idx] = 0.0
         self.unmask_ranks[slot_idx] = 0
         self.unmask_entropy[slot_idx] = 0.0
+        self.unmask_step[slot_idx] = 0
 
     def remove_request(self, slot_idx: int) -> None:
         self.is_encoder_phase[slot_idx] = False
@@ -564,6 +600,15 @@ class NemotronLabsDiffusionModelState(ModelState):
         if return_entropy is None:
             return_entropy = gen_config.get("diffusion_return_entropy")
         self.return_entropy = bool(return_entropy)
+        # Opt-in per-token reveal-step channel (trajectory replay / "Trace"):
+        # surfaced as its own CompletionOutput.reveal_steps field rather than
+        # through the logprobs output, so it is independent of ``logprobs``.
+        return_reveal_steps = (
+            diffusion_config.return_reveal_steps if diffusion_config else None
+        )
+        if return_reveal_steps is None:
+            return_reveal_steps = gen_config.get("diffusion_return_reveal_steps")
+        self.return_reveal_steps = bool(return_reveal_steps)
         self.diffusion_states = NemotronLabsDiffusionRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
@@ -591,6 +636,7 @@ class NemotronLabsDiffusionModelState(ModelState):
             selection_policy=self.selection_policy,
             confidence_threshold=self.confidence_threshold,
             return_entropy=self.return_entropy,
+            return_reveal_steps=self.return_reveal_steps,
         ), None
 
     def add_request(self, req_index: int, new_req_data: Any) -> None:
@@ -696,6 +742,13 @@ class MaskedDiffusionSampler:
     logprob column keyed by ``mask_token_id``; this replaces top-k logprob
     introspection while enabled and requires requests to set ``logprobs>=1``.
 
+    With ``return_reveal_steps`` (``DiffusionConfig.return_reveal_steps`` or
+    the ``diffusion_return_reveal_steps`` generation-config key), each commit
+    also emits the block-relative denoise step that revealed each token via
+    ``SamplerOutput.reveal_steps``, which the engine surfaces as
+    ``CompletionOutput.reveal_steps``. Unlike the entropy channel this rides
+    its own field, so it needs no logprobs and composes with either.
+
     Logprobs: the sampled token's logprob/rank (the ``logprobs=0`` path, used
     by RL rollouts) are captured at the denoise step each position was
     unmasked, i.e. under the distribution the token was actually sampled
@@ -716,6 +769,7 @@ class MaskedDiffusionSampler:
         selection_policy: str = "low_confidence",
         confidence_threshold: float = 0.9,
         return_entropy: bool = False,
+        return_reveal_steps: bool = False,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
@@ -731,6 +785,9 @@ class MaskedDiffusionSampler:
         # Emit at-unmask entropy as a second logprob column keyed by
         # mask_token_id (replaces top-k introspection while enabled).
         self.return_entropy = return_entropy
+        # Emit the block-relative reveal step of each token on its own
+        # SamplerOutput field (independent of the logprobs channel).
+        self.return_reveal_steps = return_reveal_steps
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
@@ -738,6 +795,10 @@ class MaskedDiffusionSampler:
             max_num_reqs, self.canvas_length, dtype=torch.int32, device=device
         )
         self._num_sampled = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        # Parallel to ``_sampled``; only written when return_reveal_steps.
+        self._reveal_steps = torch.zeros(
+            max_num_reqs, self.canvas_length, dtype=torch.int32, device=device
+        )
         self._decode_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._decode_idx = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._query_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
@@ -821,6 +882,7 @@ class MaskedDiffusionSampler:
         num_sampled: torch.Tensor,
         per_req_nlogits_np: np.ndarray,
         logprobs_tensors: LogprobsTensors | None = None,
+        reveal_steps: torch.Tensor | None = None,
     ) -> SamplerOutput:
         num_reqs = input_batch.num_reqs
 
@@ -843,6 +905,7 @@ class MaskedDiffusionSampler:
             num_nans=None,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            reveal_steps=reveal_steps,
         )
 
     # ------------------------------------------------------------------
@@ -904,6 +967,9 @@ class MaskedDiffusionSampler:
         num_sampled = self._num_sampled[:num_reqs]
         sampled.zero_()
         num_sampled.zero_()
+        reveal_steps = self._reveal_steps[:num_reqs]
+        if self.return_reveal_steps:
+            reveal_steps.zero_()
 
         all_slots = input_batch.idx_mapping[:num_reqs]
 
@@ -929,10 +995,12 @@ class MaskedDiffusionSampler:
             states.unmask_logprobs,
             states.unmask_ranks,
             states.unmask_entropy,
+            states.unmask_step,
             # Output
             sampled,
             num_sampled,
             self.req_states.draft_tokens,
+            reveal_steps,
             # Config
             max_denoising_steps=int(states.max_denoising_steps),
             mask_token_id=int(states.mask_token_id),
@@ -940,6 +1008,7 @@ class MaskedDiffusionSampler:
             temperature=self.temperature,
             capture_logprobs=max_num_logprobs >= 0,
             capture_entropy=self.return_entropy and max_num_logprobs >= 0,
+            capture_steps=self.return_reveal_steps,
             leftmost=self.leftmost,
             threshold_mode=self.threshold_mode,
             log_threshold=self.log_threshold,
@@ -1044,4 +1113,5 @@ class MaskedDiffusionSampler:
             num_sampled,
             per_req_nlogits_np,
             logprobs_tensors=logprobs_tensors,
+            reveal_steps=reveal_steps if self.return_reveal_steps else None,
         )

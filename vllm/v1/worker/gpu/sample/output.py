@@ -14,3 +14,8 @@ class SamplerOutput:
     num_nans: torch.Tensor | None
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
+    # [num_reqs, max_num_generated_tokens] int32, parallel to
+    # ``sampled_token_ids``: the block-relative denoising step that revealed
+    # each token. Only masked-diffusion models with return_reveal_steps set
+    # it; None everywhere else.
+    reveal_steps: torch.Tensor | None = None
