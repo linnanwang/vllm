@@ -1579,6 +1579,11 @@ class ModelConfig:
     @cached_property
     def is_diffusion(self) -> bool:
         """Detect discrete diffusion (dLLM) models from HF config."""
+        # AR variant of the Nemotron diffusion checkpoint: same config
+        # (which always sets canvas_length) but served as a plain causal
+        # LM, so it must NOT take the diffusion decode path.
+        if "NemotronLabsDiffusionForCausalLM" in self.architectures:
+            return False
         return getattr(self.hf_config, "canvas_length", None) is not None
 
     @property

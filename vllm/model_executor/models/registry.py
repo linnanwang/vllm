@@ -161,6 +161,7 @@ _TEXT_GENERATION_MODELS = {
     ),
     "Ministral3ForCausalLM": ("mistral", "MistralForCausalLM"),
     "NemotronLabsDiffusionModel": ("nemotron_dllm", "NemotronLabsDiffusionForBlockDiffusion"),
+    "NemotronLabsDiffusionForCausalLM": ("nemotron_dllm", "NemotronLabsDiffusionForCausalLM"),
     "MistralForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralLarge3ForCausalLM": ("mistral_large_3", "MistralLarge3ForCausalLM"),
     "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),

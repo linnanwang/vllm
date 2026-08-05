@@ -221,6 +221,78 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuan
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+class NemotronLabsDiffusionForCausalLM(nn.Module, SupportsPP, SupportsQuant):
+    """AR (causal) variant of the Nemotron masked block-diffusion LM.
+
+    Identical backbone (LlamaModel with NemotronLabsDiffusionDecoderLayer: YaRN
+    factor + llama-4 Q scale) and untied ``diffusion_head`` LM head as
+    NemotronLabsDiffusionForBlockDiffusion, and the SAME ``encoder.`` -> ``model.``
+    weight mapper -- so weights load bit-identically. The ONLY difference is that
+    this class does NOT define ``get_model_state_cls``, so the v1 runner falls
+    back to the default causal AR state (standard causal attention + normal
+    KV-cache decode) instead of the masked-canvas denoising path. Used for AR
+    GRPO on the ORIGINAL diffusion checkpoint: select via architectures override
+    ["NemotronLabsDiffusionForCausalLM"]; ModelConfig.is_diffusion returns False
+    for it (see config/model.py).
+    """
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "encoder.": "model.",
+        }
+    )
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # NOTE: intentionally NO get_model_state_cls -> DefaultModelState (AR path).
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+
+        self.model = LlamaModel(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            layer_type=NemotronLabsDiffusionDecoderLayer,
+        )
+        # LM head is named diffusion_head in the checkpoint and is NOT tied.
+        self.diffusion_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "diffusion_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.diffusion_head, hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
 @torch.compile(dynamic=True)
 def _compute_num_rejected(
     num_logits: torch.Tensor,
@@ -265,6 +337,7 @@ def _compiled_masked_step(
     capture_entropy: bool,
     capture_steps: bool,
     leftmost: bool,
+    random_mode: bool,
     threshold_mode: bool,
     log_threshold: float,
 ) -> torch.Tensor:
@@ -279,7 +352,9 @@ def _compiled_masked_step(
     are unmasked where k follows the even transfer schedule (remaining
     masks split evenly over remaining steps). With ``leftmost``, position
     order replaces confidence order (strictly left-to-right reveal — the
-    leftmost-reveal RL rollout policy). With ``threshold_mode``, the even
+    leftmost-reveal RL rollout policy). With ``random_mode``, a uniform random
+    order replaces confidence order (the reveal choice is independent of the
+    model scores, so the recorded logprobs are unbiased policy logprobs). With ``threshold_mode``, the even
     schedule is replaced by SGLang FastDiffuser thresholding: every masked
     position whose chosen-token logprob is >= ``log_threshold`` is unmasked,
     plus always the single most confident one so each step makes progress
@@ -350,6 +425,17 @@ def _compiled_masked_step(
         # left-to-right order instead of confidence order).
         csum = torch.cumsum(mask_index.to(torch.int64), dim=-1)
         transfer = mask_index & (csum <= k.unsqueeze(1))
+    elif random_mode:
+        # Uniform random reveal order (SGLang FastDiffuser "random"): rank the
+        # masked positions by uniform noise instead of confidence, so the
+        # choice carries no information about the model scores. k still comes
+        # from the even transfer schedule. Non-masked positions get -inf, so
+        # they can never be selected regardless of their noise draw.
+        rand_score = torch.where(mask_index, torch.rand_like(x0_logprob), neg_inf)
+        order = torch.argsort(rand_score, dim=-1, descending=True, stable=True)
+        ranks = torch.empty_like(order)
+        ranks.scatter_(1, order, pos.expand(num_decode, CL))
+        transfer = mask_index & (ranks < k.unsqueeze(1))
     elif threshold_mode:
         # FastDiffuser thresholding: unmask every masked position whose
         # chosen-token logprob clears the threshold, and always the single
@@ -575,7 +661,12 @@ class NemotronLabsDiffusionModelState(ModelState):
         selection = (
             diffusion_config.selection_policy if diffusion_config else None
         ) or gen_config.get("diffusion_selection_policy") or "low_confidence"
-        if selection not in ("low_confidence", "leftmost", "confidence_threshold"):
+        if selection not in (
+            "low_confidence",
+            "leftmost",
+            "confidence_threshold",
+            "random",
+        ):
             raise ValueError(
                 f"Unknown diffusion selection_policy: {selection!r}"
             )
@@ -609,6 +700,15 @@ class NemotronLabsDiffusionModelState(ModelState):
         if return_reveal_steps is None:
             return_reveal_steps = gen_config.get("diffusion_return_reveal_steps")
         self.return_reveal_steps = bool(return_reveal_steps)
+        # emit_full_blocks is consumed by the scheduler (it governs stop-token
+        # trimming, not sampling); read here only so the value is validated and
+        # visible in the engine log alongside the other diffusion settings.
+        emit_full_blocks = (
+            diffusion_config.emit_full_blocks if diffusion_config else None
+        )
+        if emit_full_blocks is None:
+            emit_full_blocks = gen_config.get("diffusion_emit_full_blocks")
+        self.emit_full_blocks = bool(emit_full_blocks)
         self.diffusion_states = NemotronLabsDiffusionRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
@@ -732,7 +832,8 @@ class MaskedDiffusionSampler:
     (``DiffusionConfig.temperature`` or the ``diffusion_temperature``
     generation-config key). Unmask order is ``selection_policy``:
     ``low_confidence`` (LLaDA, default), ``leftmost`` (strict left-to-right
-    reveal for leftmost-reveal RL rollouts), or ``confidence_threshold``
+    reveal for leftmost-reveal RL rollouts), ``random`` (uniform random reveal
+    order, unbiased policy logprobs), or ``confidence_threshold``
     (SGLang FastDiffuser thresholding: every position whose chosen-token
     probability exceeds ``confidence_threshold``, at least one per step).
 
@@ -779,6 +880,7 @@ class MaskedDiffusionSampler:
         self.mask_token_id = diffusion_states.mask_token_id
         self.temperature = temperature
         self.leftmost = selection_policy == "leftmost"
+        self.random_mode = selection_policy == "random"
         self.threshold_mode = selection_policy == "confidence_threshold"
         # Compared against per-position chosen-token logprobs (natural log).
         self.log_threshold = math.log(confidence_threshold)
@@ -1010,6 +1112,7 @@ class MaskedDiffusionSampler:
             capture_entropy=self.return_entropy and max_num_logprobs >= 0,
             capture_steps=self.return_reveal_steps,
             leftmost=self.leftmost,
+            random_mode=self.random_mode,
             threshold_mode=self.threshold_mode,
             log_threshold=self.log_threshold,
         )
