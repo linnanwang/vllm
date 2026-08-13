@@ -40,7 +40,9 @@ class DiffusionConfig:
     ) = None
     """Which masked positions to unmask each denoising step (masked-diffusion
     models). ``low_confidence``: the most confident predictions first (LLaDA),
-    top-k per step with k from the even transfer schedule.
+    top-k per step with k from the even transfer schedule
+    (``ceil(masks / remaining_steps)``), so tokens-per-forward is fixed at
+    ``canvas_length / max_denoising_steps``.
     ``leftmost``: strictly left-to-right — with one token per step this yields
     clean per-token policy logprobs matching a leftmost-reveal RL recompute.
     ``random``: uniform random reveal order among the still-masked positions,
@@ -50,16 +52,17 @@ class DiffusionConfig:
     ``random`` decode, used by the trajectory-replay baselines.
     ``confidence_threshold``: unmask every position whose chosen-token
     probability exceeds ``confidence_threshold`` (always at least the single
-    most confident one, so each step makes progress) — the SGLang
-    FastDiffuser thresholding decode.
+    most confident one, so each step makes progress). Tokens-per-forward is
+    then adaptive rather than scheduled, matching the SGLang FastDiffuser and
+    Megatron-Bridge thresholding decode.
     If not set, read from the model's generation_config.json
     (``diffusion_selection_policy``), defaulting to ``low_confidence``."""
 
     confidence_threshold: float | None = Field(default=None, gt=0, lt=1)
-    """Probability threshold for ``selection_policy="confidence_threshold"``.
-    If not set, read from the model's generation_config.json
-    (``diffusion_confidence_threshold``), defaulting to 0.9. Ignored by the
-    other selection policies."""
+    """Probability bar a masked position must clear to be unmasked under
+    ``selection_policy="confidence_threshold"``. If not set, read from the
+    model's generation_config.json (``diffusion_confidence_threshold``),
+    defaulting to 0.9. Ignored by the other selection policies."""
 
     return_entropy: bool | None = None
     """Emit per-token entropy ``H = -sum_v p_v log p_v`` of the sampling

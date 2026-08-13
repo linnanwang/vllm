@@ -71,6 +71,18 @@ def _hf_yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+def is_ar_mode(hf_config: PretrainedConfig) -> bool:
+    """Whether to run the checkpoint as a plain causal LM.
+
+    The backbone is trained for both generation modes, so setting
+    ``ar_mode`` on the HF config (``--hf-overrides '{"ar_mode": true}'``)
+    selects fully causal attention and vLLM's ordinary autoregressive
+    decode instead of the masked block-diffusion canvas. Matches the
+    SGLang port's ``ar_mode`` override.
+    """
+    return bool(getattr(hf_config, "ar_mode", False))
+
+
 class NemotronLabsDiffusionAttention(LlamaAttention):
     """Llama attention + YaRN RoPE (HF attention factor) + per-token
     llama-4 Q scaling applied after RoPE."""
@@ -172,8 +184,11 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuan
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    @staticmethod
-    def get_model_state_cls():
+    def get_model_state_cls(self):
+        if self.ar_mode:
+            from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+            return DefaultModelState
         return NemotronLabsDiffusionModelState
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -181,6 +196,7 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuan
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.ar_mode = is_ar_mode(config)
 
         self.model = LlamaModel(
             vllm_config=vllm_config,
@@ -823,6 +839,30 @@ class NemotronLabsDiffusionModelState(ModelState):
 _NO_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
 
 
+# Set when a MaskedDiffusionSampler is constructed, so out-of-band callers
+# (the NeMo-RL worker extension polling TPF over collective_rpc) can reach the
+# live sampler without walking the model-runner object graph. One diffusion
+# sampler exists per engine process.
+_ACTIVE_DIFFUSION_SAMPLER: "MaskedDiffusionSampler | None" = None
+
+
+def get_diffusion_tpf_stats(reset: bool = False) -> dict[str, int]:
+    """Return cumulative denoising forwards and committed tokens.
+
+    ``TPF = committed_tokens / nfe``. Returns zeros when the process is not
+    running a diffusion sampler (e.g. an ``ar_mode`` rollout engine).
+
+    Args:
+        reset: Zero the counters after reading, so the next call reports a
+            fresh window (one validation pass, say) rather than a running
+            total.
+    """
+    sampler = _ACTIVE_DIFFUSION_SAMPLER
+    if sampler is None:
+        return {"nfe": 0, "committed_tokens": 0}
+    return sampler.tpf_stats(reset=reset)
+
+
 class MaskedDiffusionSampler:
     """Batched masked-diffusion sampler (LLaDA-style).
 
@@ -891,6 +931,22 @@ class MaskedDiffusionSampler:
         # SamplerOutput field (independent of the logprobs channel).
         self.return_reveal_steps = return_reveal_steps
 
+        # TPF accounting. Kept on GPU and only synced when read, so the hot
+        # path stays free of device->host transfers. `nfe` counts
+        # (request, denoising-step) pairs rather than engine steps, matching
+        # the per-prompt definition the offline Megatron-Bridge harness uses,
+        # so batched and single-stream numbers are comparable. The per-block
+        # causal KV-update forward is excluded, again matching the harness.
+        self._tpf_nfe = torch.zeros(
+            (), dtype=torch.int64, device=diffusion_states.device
+        )
+        self._tpf_tokens = torch.zeros(
+            (), dtype=torch.int64, device=diffusion_states.device
+        )
+
+        global _ACTIVE_DIFFUSION_SAMPLER
+        _ACTIVE_DIFFUSION_SAMPLER = self
+
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
         self._sampled = torch.zeros(
@@ -927,6 +983,21 @@ class MaskedDiffusionSampler:
     @property
     def penalties_state(self):
         return _NO_PENALTIES_STATE
+
+    def tpf_stats(self, reset: bool = False) -> dict[str, int]:
+        """Cumulative denoising forwards and committed tokens.
+
+        This is the only device->host sync in the TPF path; the counters are
+        accumulated on GPU during decoding.
+        """
+        stats = {
+            "nfe": int(self._tpf_nfe.item()),
+            "committed_tokens": int(self._tpf_tokens.item()),
+        }
+        if reset:
+            self._tpf_nfe.zero_()
+            self._tpf_tokens.zero_()
+        return stats
 
     # ------------------------------------------------------------------
     # Prefill
@@ -1116,6 +1187,14 @@ class MaskedDiffusionSampler:
             threshold_mode=self.threshold_mode,
             log_threshold=self.log_threshold,
         )
+
+        # TPF accounting (tensor ops only -- no host sync). Rows that were
+        # denoising this step each consumed one forward; rows that committed
+        # emitted `num_sampled` tokens. Accumulated separately because a block
+        # spans many denoise steps and exactly one commit.
+        if num_decode > 0:
+            self._tpf_nfe += (~is_committing).sum()
+            self._tpf_tokens += num_sampled[decode_idx].sum()
 
         # Top-k introspection (logprobs>0): stash the converged denoise
         # step's top-k (is_encoder_phase flipped False->True); attached on
