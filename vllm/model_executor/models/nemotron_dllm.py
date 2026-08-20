@@ -966,6 +966,46 @@ class MaskedDiffusionSampler:
         # converging denoise step; consumed on the subsequent commit step.
         self._pending_logprobs: dict[int, LogprobsTensors] = {}
 
+        # ---- Thinking budget -------------------------------------------
+        # Reuse the V2 sampler's ThinkingBudgetState for the parts that are not
+        # decode-specific: it parses ReasoningConfig into token ids and stores
+        # per-request SamplingParams.thinking_token_budget. Its own apply() is
+        # unreachable here (custom_sampler replaces the V2 sampler entirely), so
+        # enforcement below is ours.
+        self._budget = getattr(sampler, "thinking_budget_state", None)
+        self._budget_end_id: int | None = None
+        if self._budget is not None and getattr(self._budget, "enabled", False):
+            end_ids = self._budget.reasoning_end_token_ids
+            if end_ids is not None and len(end_ids) == 1:
+                self._budget_end_id = int(end_ids[0].item())
+            else:
+                # A multi-token delimiter cannot be seeded into a single canvas
+                # position; refuse rather than inject a partial tag.
+                logger.warning_once(
+                    "Masked block-diffusion thinking budget requires a "
+                    "single-token reasoning end delimiter; got %s tokens. "
+                    "Thinking budget disabled for this model.",
+                    "None" if end_ids is None else len(end_ids),
+                )
+        # Cumulative committed tokens per request. Generation starts inside an
+        # open <think> block, so until the tag closes this is the thinking count.
+        self._think_total_gen = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        # end delimiter committed (naturally OR forced) -> stop consulting budget
+        self._think_end_seen = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
+        # Set ONLY by our injection, so a forced close is distinguishable from a
+        # natural one. Deliberately not plumbed to the client yet: doing so means
+        # threading a per-request field out through vLLM + Gym (the return_entropy
+        # precedent was a six-layer chain), and generation is correctly bounded
+        # without it. Kept because the distinction is what separates "reasoned
+        # badly" from "ran out of budget" when reading eval failures.
+        self._think_forced = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
+
     def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
         if use_penalty(sampling_params):
             logger.warning_once(
@@ -976,9 +1016,17 @@ class MaskedDiffusionSampler:
         # that was aborted between its converging denoise and commit steps.
         self._pending_logprobs.pop(req_idx, None)
         self.sampling_states.add_request(req_idx, sampling_params)
+        if self._budget is not None:
+            # Populates thinking_token_budget/use_thinking_budget for this slot.
+            self._budget.add_request(req_idx, sampling_params)
+        self._think_total_gen[req_idx] = 0
+        self._think_end_seen[req_idx] = False
+        self._think_forced[req_idx] = False
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
+        if self._budget is not None:
+            self._budget.apply_staged_writes()
 
     @property
     def penalties_state(self):
@@ -1195,6 +1243,61 @@ class MaskedDiffusionSampler:
         if num_decode > 0:
             self._tpf_nfe += (~is_committing).sum()
             self._tpf_tokens += num_sampled[decode_idx].sum()
+
+        # ---- Thinking budget enforcement -------------------------------
+        # Runs AFTER the compiled step, which has already reset every committing
+        # row's canvas to all-mask for the next block -- so writing position 0
+        # seeds the NEXT block. Safe because every reveal path masks its writes
+        # with `mask_index`: a non-mask position is absorbing and is never
+        # overwritten by denoising, so the injected token survives as context.
+        #
+        # Block-granular: checked once per commit. Overshoot is therefore
+        # bounded by (canvas_length - 1) and is ZERO when the budget is a
+        # multiple of canvas_length. The AR implementation is likewise
+        # step-granular.
+        #
+        # budget=0 is NOT the way to disable reasoning here. The first block
+        # commits before this check can run -- there is no commit at which
+        # total_gen is still 0 -- so a request gets exactly canvas_length (~32)
+        # thinking tokens (measured 32/32 over 16 AIME problems), where the AR
+        # path force-indexes token 0 and yields a true zero. This is deliberate,
+        # not an oversight: to disable reasoning, use enable_thinking=false in
+        # the chat template, which prefills a closed <think></think> so the
+        # block is never opened and the engine is not involved at all.
+        if self._budget_end_id is not None and num_decode > 0:
+            commit_rows = is_committing
+            if commit_rows.any():
+                commit_slots = decode_slots[commit_rows]
+                emitted = num_sampled[decode_idx][commit_rows].to(
+                    self._think_total_gen.dtype
+                )
+                self._think_total_gen[commit_slots] += emitted
+                # Scan the whole committed row: under out-of-order reveal the
+                # delimiter need not be last. Positions past the emitted length
+                # hold stale values, so mask the comparison by column index.
+                rows = sampled[decode_idx][commit_rows]
+                cols = torch.arange(rows.shape[1], device=rows.device)
+                valid = cols.unsqueeze(0) < emitted.unsqueeze(1)
+                saw_end = ((rows == self._budget_end_id) & valid).any(dim=1)
+                self._think_end_seen[commit_slots] |= saw_end
+                # budget < 0 means unset for that request (upstream sentinel).
+                budgets = self._budget.thinking_token_budget.gpu[commit_slots]
+                # >= (not >): a budget that is a multiple of canvas_length then
+                # closes exactly on it -- e.g. 512 with canvas 32 stops at 512, not
+                # 544. For a budget that is not a multiple, both forms close on the
+                # same commit, so >= is never worse.
+                needs_close = (
+                    (budgets >= 0)
+                    & (self._think_total_gen[commit_slots] >= budgets)
+                    & ~self._think_end_seen[commit_slots]
+                )
+                if needs_close.any():
+                    close_slots = commit_slots[needs_close]
+                    self.diffusion_states.canvas[close_slots, 0] = (
+                        self._budget_end_id
+                    )
+                    self._think_end_seen[close_slots] = True
+                    self._think_forced[close_slots] = True
 
         # Top-k introspection (logprobs>0): stash the converged denoise
         # step's top-k (is_encoder_phase flipped False->True); attached on
