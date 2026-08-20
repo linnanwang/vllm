@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.config.model import LogprobsMode
 from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
