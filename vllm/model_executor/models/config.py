@@ -314,7 +314,7 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
             )
 
 
-class MinistralDLMForBlockDiffusionConfig(VerifyAndUpdateConfig):
+class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Set up the diffusion config and defaults for the Nemotron
@@ -325,7 +325,18 @@ class MinistralDLMForBlockDiffusionConfig(VerifyAndUpdateConfig):
         ``max_denoising_steps`` defaults to ``canvas_length`` at
         sampler-build time when generation_config.json doesn't provide it.
         """
+        from vllm.model_executor.models.nemotron_dllm import is_ar_mode
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        model_config = vllm_config.model_config
+        if is_ar_mode(model_config.hf_config):
+            # Plain causal LM: no canvas, so no DiffusionConfig (which would
+            # otherwise route decode through the spec-decode path via
+            # num_speculative_tokens), no bidirectional attention, and no
+            # diffusion-sampler concurrency cap.
+            if "max_new_tokens" not in model_config.override_generation_config:
+                model_config.override_generation_config["max_new_tokens"] = None
+            return
 
         attention_config = vllm_config.attention_config
         if attention_config.backend == AttentionBackendEnum.FLASHINFER:
@@ -368,7 +379,6 @@ class MinistralDLMForBlockDiffusionConfig(VerifyAndUpdateConfig):
 
         # Remove any generation_config.json cap on max_new_tokens so each
         # request controls its own output length via max_tokens.
-        model_config = vllm_config.model_config
         if "max_new_tokens" not in model_config.override_generation_config:
             model_config.override_generation_config["max_new_tokens"] = None
 
@@ -911,7 +921,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "MambaForCausalLM": MambaModelConfig,
-    "MinistralDiffEncoderModel": MinistralDLMForBlockDiffusionConfig,
+    "NemotronLabsDiffusionModel": NemotronLabsDiffusionForBlockDiffusionConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,

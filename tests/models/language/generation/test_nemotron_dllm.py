@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the Nemotron Ministral masked block-diffusion LM
-(``MinistralDiffEncoderModel`` / ``nemotron_dllm``).
+(``NemotronLabsDiffusionModel`` / ``nemotron_dllm``).
 
 Tiers:
 
@@ -21,6 +21,8 @@ Tiers:
 The weights tests need the model locally (not on the public Hub): set
 ``NEMOTRON_DLM_MODEL_PATH`` or use the default. They skip when weights/GPU absent.
 """
+import gc
+import math
 import os
 
 import pytest
@@ -33,6 +35,24 @@ MODEL_PATH = os.environ.get(
 MASK_TOKEN_ID = 100
 CANVAS_LENGTH = 32
 MAX_MODEL_LEN = 2048
+
+
+def _free_engine() -> None:
+    """Release the GPU memory of an engine whose last reference was just
+    dropped by the caller.
+
+    pytest runs the whole file in one process, so an engine left alive holds
+    its ``gpu_memory_utilization`` share and the next ``LLM()`` sees too
+    little free memory to start. Callers must ``del`` their own reference
+    first -- doing it inside a helper would only drop the parameter binding
+    and leave the caller's name alive. Mirrors the teardown vLLM's own tests
+    use (see tests/models/language/pooling/test_colbert.py).
+    """
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    gc.collect()
+    cleanup_dist_env_and_memory()
+    torch.cuda.empty_cache()
 
 
 def _weights_available() -> bool:
@@ -52,9 +72,9 @@ requires_gpu = pytest.mark.skipif(
 # CPU-only: registration & diffusion detection
 # ---------------------------------------------------------------------------
 def test_config_registration():
-    from vllm.transformers_utils.configs import MinistralDLMConfig
+    from vllm.transformers_utils.configs import NemotronLabsDiffusionConfig
 
-    cfg = MinistralDLMConfig(block_size=32, mask_token_id=100)
+    cfg = NemotronLabsDiffusionConfig(block_size=32, mask_token_id=100)
     # canvas_length is the field ModelConfig.is_diffusion keys off of.
     assert cfg.canvas_length == 32
     assert cfg.mask_token_id == 100
@@ -63,7 +83,18 @@ def test_config_registration():
 def test_arch_in_model_registry():
     from vllm.model_executor.models.registry import ModelRegistry
 
-    assert "MinistralDiffEncoderModel" in ModelRegistry.get_supported_archs()
+    assert "NemotronLabsDiffusionModel" in ModelRegistry.get_supported_archs()
+
+
+def test_diffusion_config_leftmost_threshold():
+    from vllm.config.diffusion import DiffusionConfig
+
+    cfg = DiffusionConfig(
+        canvas_length=4,
+        max_denoising_steps=4,
+        selection_policy="confidence_threshold_leftmost",
+    )
+    assert cfg.selection_policy == "confidence_threshold_leftmost"
 
 
 def test_diffusion_config_temperature():
@@ -99,13 +130,17 @@ def test_masked_step_sampling_semantics():
             "phase": torch.zeros(MAX_REQS, dtype=torch.bool, device=device),
             "lp": torch.zeros(MAX_REQS, CL, dtype=torch.float32, device=device),
             "rk": torch.zeros(MAX_REQS, CL, dtype=torch.int32, device=device),
+            "ent": torch.zeros(MAX_REQS, CL, dtype=torch.float32, device=device),
+            "rs": torch.zeros(MAX_REQS, CL, dtype=torch.int32, device=device),
         }
 
     def run_step(st, logits, temperature, leftmost=False, steps=max_steps,
-                 req_temp=1.0):
+                 req_temp=1.0, random_mode=False, threshold_mode=False,
+                 threshold_leftmost=False):
         sampled = torch.zeros(1, CL, dtype=torch.int32, device=device)
         num_sampled = torch.zeros(1, dtype=torch.int32, device=device)
         draft = torch.zeros(MAX_REQS, CL, dtype=torch.int64, device=device)
+        reveal = torch.zeros(1, CL, dtype=torch.int32, device=device)
         zero = torch.zeros(1, dtype=torch.int64, device=device)
         _compiled_masked_step(
             logits.reshape(-1, V),
@@ -115,11 +150,21 @@ def test_masked_step_sampling_semantics():
             torch.full((1,), CL, dtype=torch.int64, device=device),
             torch.full((1,), req_temp, dtype=torch.float32, device=device),
             st["canvas"], st["step"], st["phase"], st["lp"], st["rk"],
-            sampled, num_sampled, draft,
+            st["ent"], st["rs"],
+            sampled, num_sampled, draft, reveal,
             max_denoising_steps=steps, mask_token_id=mask_id, CL=CL,
             temperature=temperature, capture_logprobs=True,
+            capture_entropy=True,
+            capture_steps=True,
             leftmost=leftmost,
+            random_mode=random_mode,
+            # Required (no defaults) since the confidence_threshold policy
+            # landed; False keeps the even-transfer schedule this test asserts.
+            threshold_mode=threshold_mode,
+            threshold_leftmost=threshold_leftmost,
+            log_threshold=math.log(0.9),
         )
+        return sampled, num_sampled, reveal
 
     torch.manual_seed(0)
     logits1 = torch.randn(1, CL, V, device=device) * 4.0
@@ -137,20 +182,34 @@ def test_masked_step_sampling_semantics():
     want = lp1.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
     assert torch.allclose(st["lp"][0][step1], want[step1], atol=1e-5)
     assert (st["rk"][0][step1] == 1).all()
+    # At-unmask entropy: H = -sum p log p of the same step-1 distribution.
+    want_ent = -(lp1.exp() * lp1).sum(-1)
+    assert torch.allclose(st["ent"][0][step1], want_ent[step1], atol=1e-5)
+    # Reveal step is block-relative and 0-based: the first denoise forward
+    # records step 0 for the positions it unmasks.
+    assert (st["rs"][0][step1] == 0).all()
 
     # At-unmask persistence: a second step with DIFFERENT logits must not
     # rewrite the step-1 captures, and step-2 captures reflect step-2 logits.
     lp_after1 = st["lp"][0].clone()
+    ent_after1 = st["ent"][0].clone()
     torch.manual_seed(1)
     logits2 = torch.randn(1, CL, V, device=device) * 4.0
     logits2[..., mask_id] = -100.0
     run_step(st, logits2, 0.0)
     assert not (st["canvas"][0] == mask_id).any()
     assert torch.allclose(st["lp"][0][step1], lp_after1[step1])
+    assert torch.allclose(st["ent"][0][step1], ent_after1[step1])
     step2 = ~step1
     lp2 = logits2[0].float().log_softmax(-1)
     want2 = lp2.gather(-1, st["canvas"][0].unsqueeze(-1)).squeeze(-1)
     assert torch.allclose(st["lp"][0][step2], want2[step2], atol=1e-5)
+    want2_ent = -(lp2.exp() * lp2).sum(-1)
+    assert torch.allclose(st["ent"][0][step2], want2_ent[step2], atol=1e-5)
+    # Step-2 positions record step 1; step-1 positions keep their step 0
+    # (the reveal step is captured once, at unmask, and never rewritten).
+    assert (st["rs"][0][step2] == 1).all()
+    assert (st["rs"][0][step1] == 0).all()
 
     # Sampling (T=1): draws differ across seeds; the captured logprob/rank
     # match the SAMPLED token under this step's distribution.
@@ -166,6 +225,9 @@ def test_masked_step_sampling_semantics():
         assert torch.allclose(st["lp"][0][unm], got[unm], atol=1e-5)
         ranks = (lp_ref >= got.unsqueeze(-1)).sum(-1).int()
         assert torch.equal(st["rk"][0][unm], ranks[unm])
+        # Entropy of the same sampling distribution (T=1: untempered).
+        ent_ref = -(lp_ref.exp() * lp_ref).sum(-1)
+        assert torch.allclose(st["ent"][0][unm], ent_ref[unm], atol=1e-5)
         draws.append(tuple(toks[unm].tolist()))
     assert len(set(draws)) >= 2, f"3 seeds gave identical draws: {draws}"
 
@@ -189,6 +251,31 @@ def test_masked_step_sampling_semantics():
         new = ((st["canvas"][0] != mask_id) & ~before).nonzero()
         order.extend(new.flatten().tolist())
     assert order == list(range(CL)), f"leftmost reveal order: {order}"
+
+    # Commit confident positions in parallel, then take the leftmost remaining
+    # mask even when a later candidate is more confident. Keep at-unmask scores.
+    threshold_logits = torch.full((1, CL, V), -80.0, device=device)
+    threshold_logits[..., 0] = 0.0
+    threshold_logits[0, :, 1] = torch.tensor([0.0, 2.0, 8.0, 8.0], device=device)
+    st = fresh_state()
+    for expected in ([False, False, True, True],
+                     [True, False, True, True], [True, True, True, True]):
+        run_step(st, threshold_logits, 0.0, steps=CL, threshold_leftmost=True)
+        assert (st["canvas"][0] != mask_id).tolist() == expected
+    assert st["rs"][0].tolist() == [1, 2, 0, 0]
+    expected_lp = threshold_logits[0].log_softmax(-1).gather(
+        -1, st["canvas"][0, :, None]
+    ).squeeze(-1)
+    torch.testing.assert_close(st["lp"][0], expected_lp)
+
+    # Without the new option, fallback still chooses the most confident mask.
+    threshold_logits[0, 2:, 1] = 1.0
+    st = fresh_state()
+    run_step(st, threshold_logits, 0.0, steps=CL, threshold_mode=True)
+    assert (st["canvas"][0] != mask_id).tolist() == [False, True, False, False]
+    st = fresh_state()
+    run_step(st, threshold_logits, 0.0, steps=CL, threshold_leftmost=True)
+    assert (st["canvas"][0] != mask_id).tolist() == [True, False, False, False]
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +434,8 @@ def test_logits_parity(monkeypatch):
     # (logit magnitude ~30, ULP ~0.25) across different attention kernels.
     assert argmax_match == 1.0, f"argmax mismatch on canvas: {argmax_match:.4f}"
     assert max_diff < 0.6, f"logit max|diff| too large: {max_diff:.4f}"
+    del llm
+    _free_engine()
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +463,8 @@ def test_greedy_generation(monkeypatch):
         SamplingParams(temperature=1.0, max_tokens=CANVAS_LENGTH),
     )
     text = out[0].outputs[0].text
+    del llm
+    _free_engine()
     assert "4" in text, f"unexpected generation: {text!r}"
 
 
@@ -413,3 +504,350 @@ def test_stochastic_rollouts(monkeypatch):
         for tid, entry in zip(c.token_ids, c.logprobs):
             lp = entry[tid]
             assert lp.logprob <= 1e-6 and lp.rank >= 1
+    del llm
+    _free_engine()
+
+
+# ---------------------------------------------------------------------------
+# GPU + weights: return_entropy channel (JustGRPO-Fast rollout contract)
+# ---------------------------------------------------------------------------
+@requires_gpu
+@requires_weights
+def test_return_entropy_channel(monkeypatch):
+    """diffusion_config return_entropy=True + logprobs=1 -> every generated
+    token's logprob entry carries a second column keyed by the mask token id
+    whose value is the at-unmask entropy (finite, in [0, log V])."""
+    import math
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm import LLM, SamplingParams
+
+    tok, _ = _load_hf(device="cpu")
+    msgs = [{"role": "user", "content": "Tell me a short story about a robot."}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    prompt_ids = enc["input_ids"] if not isinstance(enc, list) else enc
+
+    llm = LLM(
+        model=MODEL_PATH,
+        trust_remote_code=True,
+        enforce_eager=True,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=0.6,
+        diffusion_config={
+            "temperature": 1.0,
+            "selection_policy": "leftmost",
+            "return_entropy": True,
+        },
+    )
+    vocab_size = llm.llm_engine.model_config.get_vocab_size()
+    outs = llm.generate(
+        [{"prompt_token_ids": list(prompt_ids)}] * 2,
+        SamplingParams(temperature=1.0, max_tokens=2 * CANVAS_LENGTH, logprobs=1),
+    )
+    saw_positive_entropy = False
+    for o in outs:
+        c = o.outputs[0]
+        assert c.logprobs is not None and len(c.logprobs) == len(c.token_ids)
+        for tid, entry in zip(c.token_ids, c.logprobs):
+            assert tid != MASK_TOKEN_ID  # commits never emit the mask token
+            assert entry[tid].logprob <= 1e-6
+            assert MASK_TOKEN_ID in entry, (
+                f"missing entropy column: {list(entry.keys())}"
+            )
+            ent = entry[MASK_TOKEN_ID].logprob
+            assert 0.0 <= ent <= math.log(vocab_size) + 1e-4, ent
+            saw_positive_entropy = saw_positive_entropy or ent > 1e-3
+    del llm
+    _free_engine()
+    assert saw_positive_entropy, "all entropies ~0 at temperature 1.0"
+
+
+# ---------------------------------------------------------------------------
+# CPU-only: reveal-step config surface
+# ---------------------------------------------------------------------------
+def test_diffusion_config_return_reveal_steps():
+    from vllm.config.diffusion import DiffusionConfig
+
+    # Opt-in and off by default (None -> fall back to generation_config).
+    assert DiffusionConfig(canvas_length=32).return_reveal_steps is None
+    assert (
+        DiffusionConfig(canvas_length=32, return_reveal_steps=True).return_reveal_steps
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPU + weights: return_reveal_steps channel (Trace rollout contract)
+# ---------------------------------------------------------------------------
+@requires_gpu
+@requires_weights
+def test_return_reveal_steps_channel(monkeypatch):
+    """diffusion_config return_reveal_steps=True surfaces
+    ``CompletionOutput.reveal_steps``: one block-relative, 0-based denoising
+    step per generated token, parallel to ``token_ids``.
+
+    Under ``leftmost`` selection with the default step budget
+    (max_denoising_steps == canvas_length) the even transfer schedule reveals
+    exactly one token per step, so the step sequence within each block is
+    0, 1, ..., CANVAS_LENGTH-1 and restarts at every block commit. That makes
+    the expected value of every entry exact: ``i % CANVAS_LENGTH``.
+
+    Also asserts the channel is independent of the logprobs channel by
+    requesting no logprobs at all.
+    """
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm import LLM, SamplingParams
+
+    tok, _ = _load_hf(device="cpu")
+    msgs = [{"role": "user", "content": "Tell me a short story about a robot."}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    prompt_ids = enc["input_ids"] if not isinstance(enc, list) else enc
+
+    llm = LLM(
+        model=MODEL_PATH,
+        trust_remote_code=True,
+        enforce_eager=True,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=0.6,
+        attention_backend="TRITON_ATTN",
+        kernel_config={"enable_flashinfer_autotune": False},
+        diffusion_config={
+            "temperature": 1.0,
+            "selection_policy": "leftmost",
+            "return_reveal_steps": True,
+        },
+    )
+    outs = llm.generate(
+        [{"prompt_token_ids": list(prompt_ids)}] * 2,
+        # No logprobs: the reveal-step channel rides its own field.
+        SamplingParams(temperature=1.0, max_tokens=3 * CANVAS_LENGTH),
+    )
+    for o in outs:
+        c = o.outputs[0]
+        assert c.reveal_steps is not None, "reveal_steps channel not populated"
+        assert len(c.reveal_steps) == len(c.token_ids), (
+            f"{len(c.reveal_steps)} reveal steps vs {len(c.token_ids)} tokens"
+        )
+        assert all(isinstance(s, int) for s in c.reveal_steps)
+        assert all(0 <= s < CANVAS_LENGTH for s in c.reveal_steps), c.reveal_steps
+        expected = [i % CANVAS_LENGTH for i in range(len(c.token_ids))]
+        assert c.reveal_steps == expected, (
+            f"leftmost reveal order broken:\n got {c.reveal_steps}\nwant {expected}"
+        )
+    del llm
+    _free_engine()
+
+
+@requires_gpu
+@requires_weights
+def test_reveal_steps_absent_by_default(monkeypatch):
+    """Without return_reveal_steps the field stays None (channel is opt-in)."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm import LLM, SamplingParams
+
+    tok, _ = _load_hf(device="cpu")
+    msgs = [{"role": "user", "content": "Tell me a short story about a robot."}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    prompt_ids = enc["input_ids"] if not isinstance(enc, list) else enc
+
+    llm = LLM(
+        model=MODEL_PATH,
+        trust_remote_code=True,
+        enforce_eager=True,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=0.25,
+        attention_backend="TRITON_ATTN",
+        kernel_config={"enable_flashinfer_autotune": False},
+        diffusion_config={"temperature": 1.0, "selection_policy": "leftmost"},
+    )
+    outs = llm.generate(
+        [{"prompt_token_ids": list(prompt_ids)}],
+        SamplingParams(temperature=1.0, max_tokens=CANVAS_LENGTH),
+    )
+    assert outs[0].outputs[0].reveal_steps is None
+    del llm
+    _free_engine()
+
+
+# ---------------------------------------------------------------------------
+# CPU-only: random policy + emit_full_blocks config surface
+# ---------------------------------------------------------------------------
+def test_diffusion_config_random_and_emit_full_blocks():
+    from vllm.config.diffusion import DiffusionConfig
+
+    assert (
+        DiffusionConfig(canvas_length=16, selection_policy="random").selection_policy
+        == "random"
+    )
+    # Both new knobs are opt-in (None -> fall back to generation_config).
+    assert DiffusionConfig(canvas_length=16).emit_full_blocks is None
+    assert (
+        DiffusionConfig(canvas_length=16, emit_full_blocks=True).emit_full_blocks
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPU, no weights: random reveal-order semantics
+# ---------------------------------------------------------------------------
+@requires_gpu
+def test_masked_step_random_policy():
+    """selection_policy="random" unmasks exactly k masked positions per step,
+    chosen independently of the model scores.
+
+    Asserts the three properties the trajectory-replay baselines rely on:
+      1. only masked positions are ever revealed,
+      2. the count per step still follows the even transfer schedule,
+      3. the chosen SET varies across RNG draws (i.e. it is genuinely random
+         and not a disguised confidence/positional order).
+    """
+    from vllm.model_executor.models.nemotron_dllm import _compiled_masked_step
+
+    device = "cuda"
+    CL, V, MAX_REQS = 8, 16, 2
+    mask_id = 12
+    max_steps = 4  # even schedule: k = ceil(8/4) = 2 revealed per step
+
+    def fresh_state():
+        return {
+            "canvas": torch.full(
+                (MAX_REQS, CL), mask_id, dtype=torch.int64, device=device
+            ),
+            "step": torch.zeros(MAX_REQS, dtype=torch.int32, device=device),
+            "phase": torch.zeros(MAX_REQS, dtype=torch.bool, device=device),
+            "lp": torch.zeros(MAX_REQS, CL, dtype=torch.float32, device=device),
+            "rk": torch.zeros(MAX_REQS, CL, dtype=torch.int32, device=device),
+            "ent": torch.zeros(MAX_REQS, CL, dtype=torch.float32, device=device),
+            "rs": torch.zeros(MAX_REQS, CL, dtype=torch.int32, device=device),
+        }
+
+    torch.manual_seed(0)
+    logits = torch.randn(1, CL, V, device=device) * 4.0
+    logits[..., mask_id] = -100.0
+
+    def one_step(seed):
+        torch.manual_seed(seed)
+        st = fresh_state()
+        sampled = torch.zeros(1, CL, dtype=torch.int32, device=device)
+        num_sampled = torch.zeros(1, dtype=torch.int32, device=device)
+        draft = torch.zeros(MAX_REQS, CL, dtype=torch.int64, device=device)
+        reveal = torch.zeros(1, CL, dtype=torch.int32, device=device)
+        zero = torch.zeros(1, dtype=torch.int64, device=device)
+        _compiled_masked_step(
+            logits.reshape(-1, V), zero, zero, zero,
+            torch.full((1,), CL, dtype=torch.int64, device=device),
+            torch.full((1,), 0.0, dtype=torch.float32, device=device),
+            st["canvas"], st["step"], st["phase"], st["lp"], st["rk"],
+            st["ent"], st["rs"],
+            sampled, num_sampled, draft, reveal,
+            max_denoising_steps=max_steps, mask_token_id=mask_id, CL=CL,
+            temperature=0.0, capture_logprobs=True, capture_entropy=False,
+            capture_steps=True, leftmost=False, random_mode=True,
+            threshold_mode=False, log_threshold=math.log(0.9),
+        )
+        revealed = (st["canvas"][0] != mask_id)
+        return frozenset(revealed.nonzero(as_tuple=True)[0].tolist())
+
+    sets = [one_step(s) for s in range(12)]
+
+    # (1)+(2): exactly k = ceil(CL / max_steps) positions revealed each time,
+    # and every revealed index is a real canvas position.
+    for s in sets:
+        assert len(s) == CL // max_steps, f"revealed {len(s)} positions, want 2"
+        assert all(0 <= i < CL for i in s)
+
+    # (3): the choice is random, not a fixed confidence/positional order. A
+    # deterministic policy would return the same 2 positions for every seed.
+    assert len(set(sets)) > 1, f"random policy gave identical picks: {sets[0]}"
+    # Over 12 draws every position should be reachable; a confidence- or
+    # leftmost-ordered policy would concentrate on a fixed few.
+    assert len(set().union(*sets)) > CL // max_steps, (
+        f"random policy only ever reached {set().union(*sets)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPU + weights: emit_full_blocks keeps the block a stop token landed in
+# ---------------------------------------------------------------------------
+def _emit_full_blocks_run(monkeypatch, emit_full_blocks: bool):
+    """Generate once with no stop token, then again stopping on a token that
+    lands mid-block. Returns (baseline_ids, stopped_len, stop_index)."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm import LLM, SamplingParams
+
+    tok, _ = _load_hf(device="cpu")
+    msgs = [{"role": "user", "content": "Tell me a short story about a robot."}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    prompt_ids = enc["input_ids"] if not isinstance(enc, list) else enc
+
+    diffusion_config = {
+        # Greedy + leftmost => deterministic, and every committed block is
+        # exactly CANVAS_LENGTH tokens, so block alignment is checkable.
+        "temperature": 0.0,
+        "selection_policy": "leftmost",
+    }
+    if emit_full_blocks:
+        diffusion_config["emit_full_blocks"] = True
+
+    llm = LLM(
+        model=MODEL_PATH,
+        trust_remote_code=True,
+        enforce_eager=True,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=0.4,
+        attention_backend="TRITON_ATTN",
+        kernel_config={"enable_flashinfer_autotune": False},
+        diffusion_config=diffusion_config,
+    )
+    req = [{"prompt_token_ids": list(prompt_ids)}]
+    base = llm.generate(
+        req, SamplingParams(temperature=1.0, max_tokens=3 * CANVAS_LENGTH)
+    )[0].outputs[0]
+    base_ids = list(base.token_ids)
+    assert len(base_ids) >= 2 * CANVAS_LENGTH, f"too short: {len(base_ids)}"
+
+    # A token strictly inside the SECOND block -> a mid-block stop.
+    stop_index = CANVAS_LENGTH + CANVAS_LENGTH // 2
+    stop_id = base_ids[stop_index]
+    # Use its FIRST occurrence: that is where generation will actually stop.
+    stop_index = base_ids.index(stop_id)
+
+    out = llm.generate(
+        req,
+        SamplingParams(
+            temperature=1.0, max_tokens=3 * CANVAS_LENGTH, stop_token_ids=[stop_id]
+        ),
+    )[0].outputs[0]
+    stopped_len = len(out.token_ids)
+    del llm
+    _free_engine()
+    return base_ids, stopped_len, stop_index
+
+
+@requires_gpu
+@requires_weights
+def test_emit_full_blocks_off_trims_at_stop(monkeypatch):
+    """Default: output is trimmed exactly at the stop token."""
+    _base, stopped_len, stop_index = _emit_full_blocks_run(
+        monkeypatch, emit_full_blocks=False
+    )
+    assert stopped_len == stop_index + 1, (
+        f"expected trim at stop token ({stop_index + 1}), got {stopped_len}"
+    )
+
+
+@requires_gpu
+@requires_weights
+def test_emit_full_blocks_on_keeps_whole_block(monkeypatch):
+    """emit_full_blocks: the block the stop token landed in is kept whole, so
+    the output length rounds UP to a block boundary."""
+    _base, stopped_len, stop_index = _emit_full_blocks_run(
+        monkeypatch, emit_full_blocks=True
+    )
+    expected = -(-(stop_index + 1) // CANVAS_LENGTH) * CANVAS_LENGTH
+    assert stopped_len == expected, (
+        f"stop at index {stop_index} should extend to the block boundary "
+        f"({expected}), got {stopped_len}"
+    )
+    assert stopped_len % CANVAS_LENGTH == 0
+    assert stopped_len > stop_index, "emit_full_blocks did not extend the output"

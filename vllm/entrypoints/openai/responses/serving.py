@@ -712,7 +712,16 @@ class OpenAIServingResponses(GenerateBaseServing):
                 token_ids = context.render_for_completion()
                 engine_input = tokens_input(token_ids)
 
-                sampling_params.max_tokens = max_model_len - len(token_ids)
+                # Respect the per-request cap (max_output_tokens <- max_new_tokens on the NeMo-RL
+                # gym path) in the Harmony multi-turn branch too. Upstream only bounded max_tokens
+                # by the context window, so max_new_tokens was silently ignored for tool-use agents
+                # -> runaway AR generation and training-side log-softmax OOM.
+                _mt = max_model_len - len(token_ids)
+                _req = getattr(context, "request", None)
+                _cap = getattr(_req, "max_output_tokens", None) if _req is not None else None
+                if _cap:
+                    _mt = min(_mt, _cap)
+                sampling_params.max_tokens = _mt
             elif isinstance(context, ParsableContext):
                 (engine_input,) = await self._render_next_turn(
                     context.request,

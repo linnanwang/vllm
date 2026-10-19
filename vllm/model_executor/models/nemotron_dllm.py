@@ -71,7 +71,19 @@ def _hf_yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-class MinistralDLMAttention(LlamaAttention):
+def is_ar_mode(hf_config: PretrainedConfig) -> bool:
+    """Whether to run the checkpoint as a plain causal LM.
+
+    The backbone is trained for both generation modes, so setting
+    ``ar_mode`` on the HF config (``--hf-overrides '{"ar_mode": true}'``)
+    selects fully causal attention and vLLM's ordinary autoregressive
+    decode instead of the masked block-diffusion canvas. Matches the
+    SGLang port's ``ar_mode`` override.
+    """
+    return bool(getattr(hf_config, "ar_mode", False))
+
+
+class NemotronLabsDiffusionAttention(LlamaAttention):
     """Llama attention + YaRN RoPE (HF attention factor) + per-token
     llama-4 Q scaling applied after RoPE."""
 
@@ -137,7 +149,7 @@ class MinistralDLMAttention(LlamaAttention):
         return output
 
 
-class MinistralDLMDecoderLayer(LlamaDecoderLayer):
+class NemotronLabsDiffusionDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -148,17 +160,17 @@ class MinistralDLMDecoderLayer(LlamaDecoderLayer):
             vllm_config,
             prefix=prefix,
             config=config,
-            attn_layer_type=MinistralDLMAttention,
+            attn_layer_type=NemotronLabsDiffusionAttention,
         )
 
 
-class MinistralDLMForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
+class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
     """Ministral masked block-diffusion LM for vLLM.
 
     The backbone is a stock ``LlamaModel`` with Ministral parameters; the
     only architectural deltas live in the attention layer (YaRN factor and
     llama-4 Q scale). Mixed causal/bidirectional attention is driven by
-    ``MinistralDLMModelState.prepare_attn`` via a per-request causal tensor.
+    ``NemotronLabsDiffusionModelState.prepare_attn`` via a per-request causal tensor.
     """
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -172,9 +184,86 @@ class MinistralDLMForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    @staticmethod
-    def get_model_state_cls():
-        return MinistralDLMModelState
+    def get_model_state_cls(self):
+        if self.ar_mode:
+            from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+            return DefaultModelState
+        return NemotronLabsDiffusionModelState
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.ar_mode = is_ar_mode(config)
+
+        self.model = LlamaModel(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            layer_type=NemotronLabsDiffusionDecoderLayer,
+        )
+        # The LM head is named diffusion_head in the checkpoint and is NOT
+        # tied to the embeddings.
+        self.diffusion_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "diffusion_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.diffusion_head, hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+class NemotronLabsDiffusionForCausalLM(nn.Module, SupportsPP, SupportsQuant):
+    """AR (causal) variant of the Nemotron masked block-diffusion LM.
+
+    Identical backbone (LlamaModel with NemotronLabsDiffusionDecoderLayer: YaRN
+    factor + llama-4 Q scale) and untied ``diffusion_head`` LM head as
+    NemotronLabsDiffusionForBlockDiffusion, and the SAME ``encoder.`` -> ``model.``
+    weight mapper -- so weights load bit-identically. The ONLY difference is that
+    this class does NOT define ``get_model_state_cls``, so the v1 runner falls
+    back to the default causal AR state (standard causal attention + normal
+    KV-cache decode) instead of the masked-canvas denoising path. Used for AR
+    GRPO on the ORIGINAL diffusion checkpoint: select via architectures override
+    ["NemotronLabsDiffusionForCausalLM"]; ModelConfig.is_diffusion returns False
+    for it (see config/model.py).
+    """
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "encoder.": "model.",
+        }
+    )
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # NOTE: intentionally NO get_model_state_cls -> DefaultModelState (AR path).
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -185,10 +274,9 @@ class MinistralDLMForBlockDiffusion(nn.Module, SupportsPP, SupportsQuant):
         self.model = LlamaModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
-            layer_type=MinistralDLMDecoderLayer,
+            layer_type=NemotronLabsDiffusionDecoderLayer,
         )
-        # The LM head is named diffusion_head in the checkpoint and is NOT
-        # tied to the embeddings.
+        # LM head is named diffusion_head in the checkpoint and is NOT tied.
         self.diffusion_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -249,20 +337,29 @@ def _compiled_masked_step(
     is_encoder_phase: torch.Tensor,  # [max_num_reqs]
     unmask_logprobs: torch.Tensor,  # [max_num_reqs, CL] fp32
     unmask_ranks: torch.Tensor,  # [max_num_reqs, CL] int32
+    unmask_entropy: torch.Tensor,  # [max_num_reqs, CL] fp32
+    unmask_step: torch.Tensor,  # [max_num_reqs, CL] int32
     # Output tensors (modified in-place)
     sampled: torch.Tensor,  # [num_reqs, CL]
     num_sampled: torch.Tensor,  # [num_reqs]
     draft_tokens: torch.Tensor,  # [max_num_reqs, >=CL]
+    reveal_steps: torch.Tensor,  # [num_reqs, CL] int32
     # Scalar config
     max_denoising_steps: int,
     mask_token_id: int,
     CL: int,
     temperature: float,
     capture_logprobs: bool,
+    capture_entropy: bool,
+    capture_steps: bool,
     leftmost: bool,
+    random_mode: bool,
+    threshold_mode: bool,
+    log_threshold: float,
+    threshold_leftmost: bool = False,
 ) -> torch.Tensor:
-    """Compiled masked-diffusion step (low-confidence or leftmost selection,
-    absorbing state).
+    """Compiled masked-diffusion step (low-confidence, leftmost, or
+    confidence-threshold selection, absorbing state).
 
     Per denoise step: x0 over the whole canvas — greedy argmax when
     ``temperature == 0``, otherwise sampled from ``softmax(logits / T)``
@@ -272,7 +369,16 @@ def _compiled_masked_step(
     are unmasked where k follows the even transfer schedule (remaining
     masks split evenly over remaining steps). With ``leftmost``, position
     order replaces confidence order (strictly left-to-right reveal — the
-    leftmost-reveal RL rollout policy). Unmasked positions are never
+    leftmost-reveal RL rollout policy). With ``random_mode``, a uniform random
+    order replaces confidence order (the reveal choice is independent of the
+    model scores, so the recorded logprobs are unbiased policy logprobs). With ``threshold_mode``, the even
+    schedule is replaced by SGLang FastDiffuser thresholding: every masked
+    position whose chosen-token logprob is >= ``log_threshold`` is unmasked,
+    plus always the single most confident one so each step makes progress
+    (worst case degrades to one-token-per-step and the ``canvas_length``
+    default step budget still terminates). ``threshold_leftmost`` instead
+    reveals the leftmost mask when no candidate clears the threshold.
+    Unmasked positions are never
     re-masked. A request converges when no masks remain or the step budget
     is reached; the next step commits the block (causal, writes KV) and
     resets the canvas to masks.
@@ -282,6 +388,15 @@ def _compiled_masked_step(
     into ``unmask_logprobs``/``unmask_ranks`` at the step each position is
     unmasked, so the logprobs emitted at commit reflect the distribution
     each token was actually sampled from (not the final denoise step's).
+    With ``capture_entropy`` (requires ``capture_logprobs``), the entropy
+    ``H = -sum_v p_v log p_v`` of that same at-unmask sampling distribution
+    is written into ``unmask_entropy`` (the DiffusionConfig.return_entropy
+    channel, consumed by the JustGRPO-Fast trainer).
+    With ``capture_steps`` (independent of ``capture_logprobs``), the
+    block-relative denoise step that unmasked each position is written into
+    ``unmask_step`` and emitted through ``reveal_steps`` on the commit step
+    (the DiffusionConfig.return_reveal_steps channel, consumed by the
+    trajectory-replay "Trace" trainer).
 
     Returns the fp32 logits ``[num_decode, CL, vocab]`` so the caller can
     compute top-k logprobs outside the compiled region.
@@ -329,6 +444,32 @@ def _compiled_masked_step(
         # left-to-right order instead of confidence order).
         csum = torch.cumsum(mask_index.to(torch.int64), dim=-1)
         transfer = mask_index & (csum <= k.unsqueeze(1))
+    elif random_mode:
+        # Uniform random reveal order (SGLang FastDiffuser "random"): rank the
+        # masked positions by uniform noise instead of confidence, so the
+        # choice carries no information about the model scores. k still comes
+        # from the even transfer schedule. Non-masked positions get -inf, so
+        # they can never be selected regardless of their noise draw.
+        rand_score = torch.where(mask_index, torch.rand_like(x0_logprob), neg_inf)
+        order = torch.argsort(rand_score, dim=-1, descending=True, stable=True)
+        ranks = torch.empty_like(order)
+        ranks.scatter_(1, order, pos.expand(num_decode, CL))
+        transfer = mask_index & (ranks < k.unsqueeze(1))
+    elif threshold_leftmost:
+        above = mask_index & (confidence >= log_threshold)
+        first = mask_index & (mask_index.to(torch.int64).cumsum(-1) == 1)
+        transfer = above | (first & ~above.any(dim=-1, keepdim=True))
+    elif threshold_mode:
+        # FastDiffuser thresholding: unmask every masked position whose
+        # chosen-token logprob clears the threshold, and always the single
+        # most confident one (guaranteed progress; also covers the case
+        # where nothing clears the bar). `confidence` is -inf outside
+        # mask_index, so argmax lands on a masked position whenever one
+        # exists and both terms are automatically gated by mask_index.
+        above = confidence >= log_threshold
+        top1 = confidence.argmax(dim=-1, keepdim=True)  # [num_decode, 1]
+        force = torch.zeros_like(mask_index).scatter_(1, top1, True)
+        transfer = mask_index & (above | force)
     else:
         # Top-k per row with per-row k: rank positions by confidence (desc).
         order = torch.argsort(confidence, dim=-1, descending=True, stable=True)
@@ -354,6 +495,28 @@ def _compiled_masked_step(
         )
         unmask_ranks[decode_slots] = torch.where(
             write, chosen_rank, unmask_ranks[decode_slots]
+        )
+        if capture_entropy:
+            # Entropy of the same at-unmask sampling distribution the
+            # chosen token's logprob is scored under.
+            token_entropy = -(sample_lp.exp() * sample_lp).sum(dim=-1)
+            unmask_entropy[decode_slots] = torch.where(
+                write, token_entropy, unmask_entropy[decode_slots]
+            )
+
+    # ---- At-unmask reveal-step capture (block-relative denoise step) ----
+    # Deliberately outside the ``capture_logprobs`` block: the reveal-step
+    # channel does not ride the logprobs output, so it must work at
+    # ``logprobs=0`` and when logprobs are off entirely. ``cur_step`` is the
+    # pre-increment counter, which resets to 0 at every commit, so the
+    # recorded value is block-relative and 0-based -- the same convention as
+    # the SGLang fork's ``commit_step``.
+    if capture_steps:
+        step_write = transfer & is_denoise.unsqueeze(1)
+        unmask_step[decode_slots] = torch.where(
+            step_write,
+            cur_step.to(unmask_step.dtype).unsqueeze(1),
+            unmask_step[decode_slots],
         )
 
     # ---- Absorbing-state update (denoise rows only) ----
@@ -390,6 +553,12 @@ def _compiled_masked_step(
     num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * emit_len.to(
         num_sampled.dtype
     )
+    if capture_steps:
+        # Parallel to ``sampled``, emitted on the commit step only. Trimmed to
+        # ``num_sampled`` downstream, exactly like ``sampled_token_ids``.
+        reveal_steps[decode_idx] = unmask_step[decode_slots].to(
+            reveal_steps.dtype
+        ) * is_commit.unsqueeze(1).to(reveal_steps.dtype)
 
     # ---- Convergence: no masks remain, or step budget exhausted ----
     masks_left = ((new_canvas == mask_token_id) & valid).sum(dim=-1)
@@ -405,7 +574,7 @@ def _compiled_masked_step(
     return logits_3d
 
 
-class MinistralDLMRequestStates:
+class NemotronLabsDiffusionRequestStates:
     """Pre-allocated GPU tensors for per-request masked-diffusion state."""
 
     def __init__(
@@ -443,6 +612,17 @@ class MinistralDLMRequestStates:
         self.unmask_ranks = torch.zeros(
             max_num_reqs, canvas_length, dtype=torch.int32, device=device
         )
+        # Per-position entropy of the at-unmask sampling distribution;
+        # populated only when the sampler runs with return_entropy.
+        self.unmask_entropy = torch.zeros(
+            max_num_reqs, canvas_length, dtype=torch.float32, device=device
+        )
+        # Per-position block-relative denoise step at which the position was
+        # unmasked; populated only when the sampler runs with
+        # return_reveal_steps.
+        self.unmask_step = torch.zeros(
+            max_num_reqs, canvas_length, dtype=torch.int32, device=device
+        )
 
     def init_canvas(self, slot_indices) -> None:
         """Reset the canvas to all-mask for the given slots."""
@@ -454,12 +634,14 @@ class MinistralDLMRequestStates:
         self.step[slot_idx] = 0
         self.unmask_logprobs[slot_idx] = 0.0
         self.unmask_ranks[slot_idx] = 0
+        self.unmask_entropy[slot_idx] = 0.0
+        self.unmask_step[slot_idx] = 0
 
     def remove_request(self, slot_idx: int) -> None:
         self.is_encoder_phase[slot_idx] = False
 
 
-class MinistralDLMModelState(ModelState):
+class NemotronLabsDiffusionModelState(ModelState):
     """ModelState for the Ministral masked block-diffusion LM.
 
     Single backbone in two modes:
@@ -502,12 +684,63 @@ class MinistralDLMModelState(ModelState):
         selection = (
             diffusion_config.selection_policy if diffusion_config else None
         ) or gen_config.get("diffusion_selection_policy") or "low_confidence"
-        if selection not in ("low_confidence", "leftmost"):
+        if selection not in (
+            "low_confidence",
+            "leftmost",
+            "confidence_threshold",
+            "confidence_threshold_leftmost",
+            "random",
+        ):
             raise ValueError(
                 f"Unknown diffusion selection_policy: {selection!r}"
             )
+        if (
+            selection == "confidence_threshold_leftmost"
+            and max_denoising_steps < canvas_length
+        ):
+            raise ValueError(
+                "Leftmost threshold fallback requires at least canvas_length steps"
+            )
         self.selection_policy = selection
-        self.diffusion_states = MinistralDLMRequestStates(
+        # Probability threshold for selection_policy="confidence_threshold"
+        # (SGLang FastDiffuser thresholding). None-checks rather than `or`
+        # so an explicit small value is honored.
+        threshold = (
+            diffusion_config.confidence_threshold if diffusion_config else None
+        )
+        if threshold is None:
+            threshold = gen_config.get("diffusion_confidence_threshold")
+        if threshold is None:
+            threshold = 0.9
+        self.confidence_threshold = float(threshold)
+        # Opt-in per-token entropy channel (JustGRPO-Fast): emitted through
+        # the sample-logprobs output as a second column keyed by
+        # mask_token_id; requests must ask for logprobs>=1 to receive it.
+        return_entropy = (
+            diffusion_config.return_entropy if diffusion_config else None
+        )
+        if return_entropy is None:
+            return_entropy = gen_config.get("diffusion_return_entropy")
+        self.return_entropy = bool(return_entropy)
+        # Opt-in per-token reveal-step channel (trajectory replay / "Trace"):
+        # surfaced as its own CompletionOutput.reveal_steps field rather than
+        # through the logprobs output, so it is independent of ``logprobs``.
+        return_reveal_steps = (
+            diffusion_config.return_reveal_steps if diffusion_config else None
+        )
+        if return_reveal_steps is None:
+            return_reveal_steps = gen_config.get("diffusion_return_reveal_steps")
+        self.return_reveal_steps = bool(return_reveal_steps)
+        # emit_full_blocks is consumed by the scheduler (it governs stop-token
+        # trimming, not sampling); read here only so the value is validated and
+        # visible in the engine log alongside the other diffusion settings.
+        emit_full_blocks = (
+            diffusion_config.emit_full_blocks if diffusion_config else None
+        )
+        if emit_full_blocks is None:
+            emit_full_blocks = gen_config.get("diffusion_emit_full_blocks")
+        self.emit_full_blocks = bool(emit_full_blocks)
+        self.diffusion_states = NemotronLabsDiffusionRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
             mask_token_id=getattr(hf_config, "mask_token_id", 100),
@@ -532,6 +765,9 @@ class MinistralDLMModelState(ModelState):
             diffusion_states=self.diffusion_states,
             temperature=self.sampling_temperature,
             selection_policy=self.selection_policy,
+            confidence_threshold=self.confidence_threshold,
+            return_entropy=self.return_entropy,
+            return_reveal_steps=self.return_reveal_steps,
         ), None
 
     def add_request(self, req_index: int, new_req_data: Any) -> None:
@@ -618,6 +854,30 @@ class MinistralDLMModelState(ModelState):
 _NO_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
 
 
+# Set when a MaskedDiffusionSampler is constructed, so out-of-band callers
+# (the NeMo-RL worker extension polling TPF over collective_rpc) can reach the
+# live sampler without walking the model-runner object graph. One diffusion
+# sampler exists per engine process.
+_ACTIVE_DIFFUSION_SAMPLER: "MaskedDiffusionSampler | None" = None
+
+
+def get_diffusion_tpf_stats(reset: bool = False) -> dict[str, int]:
+    """Return cumulative denoising forwards and committed tokens.
+
+    ``TPF = committed_tokens / nfe``. Returns zeros when the process is not
+    running a diffusion sampler (e.g. an ``ar_mode`` rollout engine).
+
+    Args:
+        reset: Zero the counters after reading, so the next call reports a
+            fresh window (one validation pass, say) rather than a running
+            total.
+    """
+    sampler = _ACTIVE_DIFFUSION_SAMPLER
+    if sampler is None:
+        return {"nfe": 0, "committed_tokens": 0}
+    return sampler.tpf_stats(reset=reset)
+
+
 class MaskedDiffusionSampler:
     """Batched masked-diffusion sampler (LLaDA-style).
 
@@ -626,8 +886,24 @@ class MaskedDiffusionSampler:
     is rejected for diffusion models, so the temperature is engine-wide
     (``DiffusionConfig.temperature`` or the ``diffusion_temperature``
     generation-config key). Unmask order is ``selection_policy``:
-    ``low_confidence`` (LLaDA, default) or ``leftmost`` (strict left-to-right
-    reveal for leftmost-reveal RL rollouts).
+    ``low_confidence`` (LLaDA, default), ``leftmost`` (strict left-to-right
+    reveal for leftmost-reveal RL rollouts), ``random`` (uniform random reveal
+    order, unbiased policy logprobs), or ``confidence_threshold``
+    (SGLang FastDiffuser thresholding: every position whose chosen-token
+    probability exceeds ``confidence_threshold``, at least one per step).
+
+    With ``return_entropy`` (``DiffusionConfig.return_entropy`` or the
+    ``diffusion_return_entropy`` generation-config key), commits emit the
+    at-unmask entropy of each token's sampling distribution as a second
+    logprob column keyed by ``mask_token_id``; this replaces top-k logprob
+    introspection while enabled and requires requests to set ``logprobs>=1``.
+
+    With ``return_reveal_steps`` (``DiffusionConfig.return_reveal_steps`` or
+    the ``diffusion_return_reveal_steps`` generation-config key), each commit
+    also emits the block-relative denoise step that revealed each token via
+    ``SamplerOutput.reveal_steps``, which the engine surfaces as
+    ``CompletionOutput.reveal_steps``. Unlike the entropy channel this rides
+    its own field, so it needs no logprobs and composes with either.
 
     Logprobs: the sampled token's logprob/rank (the ``logprobs=0`` path, used
     by RL rollouts) are captured at the denoise step each position was
@@ -644,9 +920,12 @@ class MaskedDiffusionSampler:
         self,
         sampler: Any,
         vocab_size: int,
-        diffusion_states: MinistralDLMRequestStates,
+        diffusion_states: NemotronLabsDiffusionRequestStates,
         temperature: float = 0.0,
         selection_policy: str = "low_confidence",
+        confidence_threshold: float = 0.9,
+        return_entropy: bool = False,
+        return_reveal_steps: bool = False,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
@@ -656,6 +935,33 @@ class MaskedDiffusionSampler:
         self.mask_token_id = diffusion_states.mask_token_id
         self.temperature = temperature
         self.leftmost = selection_policy == "leftmost"
+        self.random_mode = selection_policy == "random"
+        self.threshold_mode = selection_policy == "confidence_threshold"
+        self.threshold_leftmost = selection_policy == "confidence_threshold_leftmost"
+        # Compared against per-position chosen-token logprobs (natural log).
+        self.log_threshold = math.log(confidence_threshold)
+        # Emit at-unmask entropy as a second logprob column keyed by
+        # mask_token_id (replaces top-k introspection while enabled).
+        self.return_entropy = return_entropy
+        # Emit the block-relative reveal step of each token on its own
+        # SamplerOutput field (independent of the logprobs channel).
+        self.return_reveal_steps = return_reveal_steps
+
+        # TPF accounting. Kept on GPU and only synced when read, so the hot
+        # path stays free of device->host transfers. `nfe` counts
+        # (request, denoising-step) pairs rather than engine steps, matching
+        # the per-prompt definition the offline Megatron-Bridge harness uses,
+        # so batched and single-stream numbers are comparable. The per-block
+        # causal KV-update forward is excluded, again matching the harness.
+        self._tpf_nfe = torch.zeros(
+            (), dtype=torch.int64, device=diffusion_states.device
+        )
+        self._tpf_tokens = torch.zeros(
+            (), dtype=torch.int64, device=diffusion_states.device
+        )
+
+        global _ACTIVE_DIFFUSION_SAMPLER
+        _ACTIVE_DIFFUSION_SAMPLER = self
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
@@ -663,6 +969,10 @@ class MaskedDiffusionSampler:
             max_num_reqs, self.canvas_length, dtype=torch.int32, device=device
         )
         self._num_sampled = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        # Parallel to ``_sampled``; only written when return_reveal_steps.
+        self._reveal_steps = torch.zeros(
+            max_num_reqs, self.canvas_length, dtype=torch.int32, device=device
+        )
         self._decode_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._decode_idx = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._query_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
@@ -671,6 +981,46 @@ class MaskedDiffusionSampler:
         # Per-slot stash for top-k (logprobs>0) tensors computed on the
         # converging denoise step; consumed on the subsequent commit step.
         self._pending_logprobs: dict[int, LogprobsTensors] = {}
+
+        # ---- Thinking budget -------------------------------------------
+        # Reuse the V2 sampler's ThinkingBudgetState for the parts that are not
+        # decode-specific: it parses ReasoningConfig into token ids and stores
+        # per-request SamplingParams.thinking_token_budget. Its own apply() is
+        # unreachable here (custom_sampler replaces the V2 sampler entirely), so
+        # enforcement below is ours.
+        self._budget = getattr(sampler, "thinking_budget_state", None)
+        self._budget_end_id: int | None = None
+        if self._budget is not None and getattr(self._budget, "enabled", False):
+            end_ids = self._budget.reasoning_end_token_ids
+            if end_ids is not None and len(end_ids) == 1:
+                self._budget_end_id = int(end_ids[0].item())
+            else:
+                # A multi-token delimiter cannot be seeded into a single canvas
+                # position; refuse rather than inject a partial tag.
+                logger.warning_once(
+                    "Masked block-diffusion thinking budget requires a "
+                    "single-token reasoning end delimiter; got %s tokens. "
+                    "Thinking budget disabled for this model.",
+                    "None" if end_ids is None else len(end_ids),
+                )
+        # Cumulative committed tokens per request. Generation starts inside an
+        # open <think> block, so until the tag closes this is the thinking count.
+        self._think_total_gen = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        # end delimiter committed (naturally OR forced) -> stop consulting budget
+        self._think_end_seen = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
+        # Set ONLY by our injection, so a forced close is distinguishable from a
+        # natural one. Deliberately not plumbed to the client yet: doing so means
+        # threading a per-request field out through vLLM + Gym (the return_entropy
+        # precedent was a six-layer chain), and generation is correctly bounded
+        # without it. Kept because the distinction is what separates "reasoned
+        # badly" from "ran out of budget" when reading eval failures.
+        self._think_forced = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
 
     def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
         if use_penalty(sampling_params):
@@ -682,13 +1032,36 @@ class MaskedDiffusionSampler:
         # that was aborted between its converging denoise and commit steps.
         self._pending_logprobs.pop(req_idx, None)
         self.sampling_states.add_request(req_idx, sampling_params)
+        if self._budget is not None:
+            # Populates thinking_token_budget/use_thinking_budget for this slot.
+            self._budget.add_request(req_idx, sampling_params)
+        self._think_total_gen[req_idx] = 0
+        self._think_end_seen[req_idx] = False
+        self._think_forced[req_idx] = False
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
+        if self._budget is not None:
+            self._budget.apply_staged_writes()
 
     @property
     def penalties_state(self):
         return _NO_PENALTIES_STATE
+
+    def tpf_stats(self, reset: bool = False) -> dict[str, int]:
+        """Cumulative denoising forwards and committed tokens.
+
+        This is the only device->host sync in the TPF path; the counters are
+        accumulated on GPU during decoding.
+        """
+        stats = {
+            "nfe": int(self._tpf_nfe.item()),
+            "committed_tokens": int(self._tpf_tokens.item()),
+        }
+        if reset:
+            self._tpf_nfe.zero_()
+            self._tpf_tokens.zero_()
+        return stats
 
     # ------------------------------------------------------------------
     # Prefill
@@ -746,6 +1119,7 @@ class MaskedDiffusionSampler:
         num_sampled: torch.Tensor,
         per_req_nlogits_np: np.ndarray,
         logprobs_tensors: LogprobsTensors | None = None,
+        reveal_steps: torch.Tensor | None = None,
     ) -> SamplerOutput:
         num_reqs = input_batch.num_reqs
 
@@ -768,6 +1142,7 @@ class MaskedDiffusionSampler:
             num_nans=None,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            reveal_steps=reveal_steps,
         )
 
     # ------------------------------------------------------------------
@@ -829,6 +1204,9 @@ class MaskedDiffusionSampler:
         num_sampled = self._num_sampled[:num_reqs]
         sampled.zero_()
         num_sampled.zero_()
+        reveal_steps = self._reveal_steps[:num_reqs]
+        if self.return_reveal_steps:
+            reveal_steps.zero_()
 
         all_slots = input_batch.idx_mapping[:num_reqs]
 
@@ -853,24 +1231,97 @@ class MaskedDiffusionSampler:
             states.is_encoder_phase,
             states.unmask_logprobs,
             states.unmask_ranks,
+            states.unmask_entropy,
+            states.unmask_step,
             # Output
             sampled,
             num_sampled,
             self.req_states.draft_tokens,
+            reveal_steps,
             # Config
             max_denoising_steps=int(states.max_denoising_steps),
             mask_token_id=int(states.mask_token_id),
             CL=CL,
             temperature=self.temperature,
             capture_logprobs=max_num_logprobs >= 0,
+            capture_entropy=self.return_entropy and max_num_logprobs >= 0,
+            capture_steps=self.return_reveal_steps,
             leftmost=self.leftmost,
+            random_mode=self.random_mode,
+            threshold_mode=self.threshold_mode,
+            threshold_leftmost=self.threshold_leftmost,
+            log_threshold=self.log_threshold,
         )
+
+        # TPF accounting (tensor ops only -- no host sync). Rows that were
+        # denoising this step each consumed one forward; rows that committed
+        # emitted `num_sampled` tokens. Accumulated separately because a block
+        # spans many denoise steps and exactly one commit.
+        if num_decode > 0:
+            self._tpf_nfe += (~is_committing).sum()
+            self._tpf_tokens += num_sampled[decode_idx].sum()
+
+        # ---- Thinking budget enforcement -------------------------------
+        # Runs AFTER the compiled step, which has already reset every committing
+        # row's canvas to all-mask for the next block -- so writing position 0
+        # seeds the NEXT block. Safe because every reveal path masks its writes
+        # with `mask_index`: a non-mask position is absorbing and is never
+        # overwritten by denoising, so the injected token survives as context.
+        #
+        # Block-granular: checked once per commit. Overshoot is therefore
+        # bounded by (canvas_length - 1) and is ZERO when the budget is a
+        # multiple of canvas_length. The AR implementation is likewise
+        # step-granular.
+        #
+        # budget=0 is NOT the way to disable reasoning here. The first block
+        # commits before this check can run -- there is no commit at which
+        # total_gen is still 0 -- so a request gets exactly canvas_length (~32)
+        # thinking tokens (measured 32/32 over 16 AIME problems), where the AR
+        # path force-indexes token 0 and yields a true zero. This is deliberate,
+        # not an oversight: to disable reasoning, use enable_thinking=false in
+        # the chat template, which prefills a closed <think></think> so the
+        # block is never opened and the engine is not involved at all.
+        if self._budget_end_id is not None and num_decode > 0:
+            commit_rows = is_committing
+            if commit_rows.any():
+                commit_slots = decode_slots[commit_rows]
+                emitted = num_sampled[decode_idx][commit_rows].to(
+                    self._think_total_gen.dtype
+                )
+                self._think_total_gen[commit_slots] += emitted
+                # Scan the whole committed row: under out-of-order reveal the
+                # delimiter need not be last. Positions past the emitted length
+                # hold stale values, so mask the comparison by column index.
+                rows = sampled[decode_idx][commit_rows]
+                cols = torch.arange(rows.shape[1], device=rows.device)
+                valid = cols.unsqueeze(0) < emitted.unsqueeze(1)
+                saw_end = ((rows == self._budget_end_id) & valid).any(dim=1)
+                self._think_end_seen[commit_slots] |= saw_end
+                # budget < 0 means unset for that request (upstream sentinel).
+                budgets = self._budget.thinking_token_budget.gpu[commit_slots]
+                # >= (not >): a budget that is a multiple of canvas_length then
+                # closes exactly on it -- e.g. 512 with canvas 32 stops at 512, not
+                # 544. For a budget that is not a multiple, both forms close on the
+                # same commit, so >= is never worse.
+                needs_close = (
+                    (budgets >= 0)
+                    & (self._think_total_gen[commit_slots] >= budgets)
+                    & ~self._think_end_seen[commit_slots]
+                )
+                if needs_close.any():
+                    close_slots = commit_slots[needs_close]
+                    self.diffusion_states.canvas[close_slots, 0] = (
+                        self._budget_end_id
+                    )
+                    self._think_end_seen[close_slots] = True
+                    self._think_forced[close_slots] = True
 
         # Top-k introspection (logprobs>0): stash the converged denoise
         # step's top-k (is_encoder_phase flipped False->True); attached on
         # the commit. The logprobs==0 path reads the at-unmask buffers
-        # instead and needs no stash.
-        if max_num_logprobs > 0 and num_decode > 0:
+        # instead and needs no stash. return_entropy replaces top-k
+        # introspection entirely (the extra column carries entropy).
+        if max_num_logprobs > 0 and not self.return_entropy and num_decode > 0:
             converged_mask = states.is_encoder_phase[decode_slots]
             just_converged = converged_mask & ~is_committing
             if just_converged.any():
@@ -907,7 +1358,33 @@ class MaskedDiffusionSampler:
                     continue
                 slot = int(slots_np[i])
                 k_i = int(valid_canvas_len_np[li])
-                if max_num_logprobs > 0:
+                if self.return_entropy:
+                    # Entropy mode (JustGRPO-Fast): two columns per token —
+                    # col 0 is the sampled token's at-unmask logprob, col 1
+                    # carries the at-unmask entropy keyed by mask_token_id
+                    # (never a committed token, so the key cannot collide).
+                    # Requests need logprobs>=1 for the extra column to
+                    # survive per-request truncation in the logprobs
+                    # processor downstream.
+                    ids = sampled[i, :k_i].to(torch.int64)
+                    parts_ids.append(
+                        torch.stack(
+                            [ids, torch.full_like(ids, self.mask_token_id)],
+                            dim=-1,
+                        )
+                    )
+                    parts_lp.append(
+                        torch.stack(
+                            [
+                                states.unmask_logprobs[slot, :k_i],
+                                states.unmask_entropy[slot, :k_i],
+                            ],
+                            dim=-1,
+                        )
+                    )
+                    parts_ranks.append(states.unmask_ranks[slot, :k_i])
+                    flat_offset += k_i
+                elif max_num_logprobs > 0:
                     lp = self._pending_logprobs.pop(slot, None)
                     if lp is None:
                         continue
@@ -938,4 +1415,5 @@ class MaskedDiffusionSampler:
             num_sampled,
             per_req_nlogits_np,
             logprobs_tensors=logprobs_tensors,
+            reveal_steps=reveal_steps if self.return_reveal_steps else None,
         )

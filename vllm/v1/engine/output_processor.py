@@ -178,6 +178,10 @@ class RequestState:
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
 
+        # Masked-diffusion reveal steps, accumulated across streaming chunks
+        # in lockstep with the output token ids.
+        self.reveal_steps: list[int] = []
+
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
@@ -399,11 +403,19 @@ class RequestState:
         if finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
 
+        # Reveal steps track token_ids one-for-one. In DELTA mode emit only
+        # this chunk's steps; guard the empty case, since `[-0:]` would resend
+        # the whole accumulated list.
+        reveal_steps = self.reveal_steps or None
+        if delta and reveal_steps:
+            reveal_steps = reveal_steps[-len(token_ids) :] if token_ids else None
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            reveal_steps=reveal_steps,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -624,6 +636,8 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+            if engine_core_output.reveal_steps:
+                req_state.reveal_steps.extend(engine_core_output.reveal_steps)
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

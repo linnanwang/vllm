@@ -1578,7 +1578,22 @@ class ModelConfig:
 
     @cached_property
     def is_diffusion(self) -> bool:
-        """Detect discrete diffusion (dLLM) models from HF config."""
+        """Detect discrete diffusion (dLLM) models from HF config.
+
+        A dLLM whose backbone also supports autoregressive decoding can be
+        run as a plain causal LM, in which case none of the diffusion
+        special-casing (canvas scheduling, engine-level sampling schedule,
+        spec-decode accounting) applies. Two selectors, kept in sync with
+        the SGLang port: the dedicated causal architecture (an
+        ``architectures`` override) or the ``ar_mode`` HF-config flag.
+        """
+        # AR variant of the Nemotron diffusion checkpoint: same config
+        # (which always sets canvas_length) but served as a plain causal
+        # LM, so it must NOT take the diffusion decode path.
+        if "NemotronLabsDiffusionForCausalLM" in self.architectures:
+            return False
+        if getattr(self.hf_config, "ar_mode", False):
+            return False
         return getattr(self.hf_config, "canvas_length", None) is not None
 
     @property

@@ -199,6 +199,12 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # Block-relative denoising step that revealed each token in
+    # ``new_token_ids`` (masked-diffusion models with return_reveal_steps).
+    # Kept last: array_like=True makes field order the wire format, and
+    # omit_defaults only drops TRAILING defaults, so this costs nothing when
+    # the channel is off.
+    reveal_steps: list[int] | None = None
 
     @property
     def finished(self) -> bool:
