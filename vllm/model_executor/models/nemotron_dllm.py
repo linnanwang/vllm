@@ -356,6 +356,7 @@ def _compiled_masked_step(
     random_mode: bool,
     threshold_mode: bool,
     log_threshold: float,
+    threshold_leftmost: bool = False,
 ) -> torch.Tensor:
     """Compiled masked-diffusion step (low-confidence, leftmost, or
     confidence-threshold selection, absorbing state).
@@ -375,7 +376,9 @@ def _compiled_masked_step(
     position whose chosen-token logprob is >= ``log_threshold`` is unmasked,
     plus always the single most confident one so each step makes progress
     (worst case degrades to one-token-per-step and the ``canvas_length``
-    default step budget still terminates). Unmasked positions are never
+    default step budget still terminates). ``threshold_leftmost`` instead
+    reveals the leftmost mask when no candidate clears the threshold.
+    Unmasked positions are never
     re-masked. A request converges when no masks remain or the step budget
     is reached; the next step commits the block (causal, writes KV) and
     resets the canvas to masks.
@@ -452,6 +455,10 @@ def _compiled_masked_step(
         ranks = torch.empty_like(order)
         ranks.scatter_(1, order, pos.expand(num_decode, CL))
         transfer = mask_index & (ranks < k.unsqueeze(1))
+    elif threshold_leftmost:
+        above = mask_index & (confidence >= log_threshold)
+        first = mask_index & (mask_index.to(torch.int64).cumsum(-1) == 1)
+        transfer = above | (first & ~above.any(dim=-1, keepdim=True))
     elif threshold_mode:
         # FastDiffuser thresholding: unmask every masked position whose
         # chosen-token logprob clears the threshold, and always the single
@@ -681,10 +688,18 @@ class NemotronLabsDiffusionModelState(ModelState):
             "low_confidence",
             "leftmost",
             "confidence_threshold",
+            "confidence_threshold_leftmost",
             "random",
         ):
             raise ValueError(
                 f"Unknown diffusion selection_policy: {selection!r}"
+            )
+        if (
+            selection == "confidence_threshold_leftmost"
+            and max_denoising_steps < canvas_length
+        ):
+            raise ValueError(
+                "Leftmost threshold fallback requires at least canvas_length steps"
             )
         self.selection_policy = selection
         # Probability threshold for selection_policy="confidence_threshold"
@@ -922,6 +937,7 @@ class MaskedDiffusionSampler:
         self.leftmost = selection_policy == "leftmost"
         self.random_mode = selection_policy == "random"
         self.threshold_mode = selection_policy == "confidence_threshold"
+        self.threshold_leftmost = selection_policy == "confidence_threshold_leftmost"
         # Compared against per-position chosen-token logprobs (natural log).
         self.log_threshold = math.log(confidence_threshold)
         # Emit at-unmask entropy as a second logprob column keyed by
@@ -1233,6 +1249,7 @@ class MaskedDiffusionSampler:
             leftmost=self.leftmost,
             random_mode=self.random_mode,
             threshold_mode=self.threshold_mode,
+            threshold_leftmost=self.threshold_leftmost,
             log_threshold=self.log_threshold,
         )
 

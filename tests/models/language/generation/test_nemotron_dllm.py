@@ -86,6 +86,17 @@ def test_arch_in_model_registry():
     assert "NemotronLabsDiffusionModel" in ModelRegistry.get_supported_archs()
 
 
+def test_diffusion_config_leftmost_threshold():
+    from vllm.config.diffusion import DiffusionConfig
+
+    cfg = DiffusionConfig(
+        canvas_length=4,
+        max_denoising_steps=4,
+        selection_policy="confidence_threshold_leftmost",
+    )
+    assert cfg.selection_policy == "confidence_threshold_leftmost"
+
+
 def test_diffusion_config_temperature():
     from vllm.config.diffusion import DiffusionConfig
 
@@ -124,7 +135,8 @@ def test_masked_step_sampling_semantics():
         }
 
     def run_step(st, logits, temperature, leftmost=False, steps=max_steps,
-                 req_temp=1.0, random_mode=False):
+                 req_temp=1.0, random_mode=False, threshold_mode=False,
+                 threshold_leftmost=False):
         sampled = torch.zeros(1, CL, dtype=torch.int32, device=device)
         num_sampled = torch.zeros(1, dtype=torch.int32, device=device)
         draft = torch.zeros(MAX_REQS, CL, dtype=torch.int64, device=device)
@@ -148,7 +160,8 @@ def test_masked_step_sampling_semantics():
             random_mode=random_mode,
             # Required (no defaults) since the confidence_threshold policy
             # landed; False keeps the even-transfer schedule this test asserts.
-            threshold_mode=False,
+            threshold_mode=threshold_mode,
+            threshold_leftmost=threshold_leftmost,
             log_threshold=math.log(0.9),
         )
         return sampled, num_sampled, reveal
@@ -238,6 +251,31 @@ def test_masked_step_sampling_semantics():
         new = ((st["canvas"][0] != mask_id) & ~before).nonzero()
         order.extend(new.flatten().tolist())
     assert order == list(range(CL)), f"leftmost reveal order: {order}"
+
+    # Commit confident positions in parallel, then take the leftmost remaining
+    # mask even when a later candidate is more confident. Keep at-unmask scores.
+    threshold_logits = torch.full((1, CL, V), -80.0, device=device)
+    threshold_logits[..., 0] = 0.0
+    threshold_logits[0, :, 1] = torch.tensor([0.0, 2.0, 8.0, 8.0], device=device)
+    st = fresh_state()
+    for expected in ([False, False, True, True],
+                     [True, False, True, True], [True, True, True, True]):
+        run_step(st, threshold_logits, 0.0, steps=CL, threshold_leftmost=True)
+        assert (st["canvas"][0] != mask_id).tolist() == expected
+    assert st["rs"][0].tolist() == [1, 2, 0, 0]
+    expected_lp = threshold_logits[0].log_softmax(-1).gather(
+        -1, st["canvas"][0, :, None]
+    ).squeeze(-1)
+    torch.testing.assert_close(st["lp"][0], expected_lp)
+
+    # Without the new option, fallback still chooses the most confident mask.
+    threshold_logits[0, 2:, 1] = 1.0
+    st = fresh_state()
+    run_step(st, threshold_logits, 0.0, steps=CL, threshold_mode=True)
+    assert (st["canvas"][0] != mask_id).tolist() == [False, True, False, False]
+    st = fresh_state()
+    run_step(st, threshold_logits, 0.0, steps=CL, threshold_leftmost=True)
+    assert (st["canvas"][0] != mask_id).tolist() == [True, False, False, False]
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,13 @@ class DiffusionConfig:
     greedy for masked-diffusion models."""
 
     selection_policy: (
-        Literal["low_confidence", "leftmost", "confidence_threshold", "random"]
+        Literal[
+            "low_confidence",
+            "leftmost",
+            "confidence_threshold",
+            "confidence_threshold_leftmost",
+            "random",
+        ]
         | None
     ) = None
     """Which masked positions to unmask each denoising step (masked-diffusion
@@ -50,6 +56,9 @@ class DiffusionConfig:
     model's scores, so each committed token's recorded logprob is an unbiased
     policy logprob (unlike confidence selection) -- the SGLang FastDiffuser
     ``random`` decode, used by the trajectory-replay baselines.
+    ``confidence_threshold_leftmost``: unmask all masked candidates at or above
+    the threshold; if none pass, reveal only the leftmost remaining mask.
+    Requires at least ``canvas_length`` denoising steps.
     ``confidence_threshold``: unmask every position whose chosen-token
     probability exceeds ``confidence_threshold`` (always at least the single
     most confident one, so each step makes progress). Tokens-per-forward is
@@ -60,7 +69,8 @@ class DiffusionConfig:
 
     confidence_threshold: float | None = Field(default=None, gt=0, lt=1)
     """Probability bar a masked position must clear to be unmasked under
-    ``selection_policy="confidence_threshold"``. If not set, read from the
+    ``confidence_threshold`` or ``confidence_threshold_leftmost`` selection.
+    If not set, read from the
     model's generation_config.json (``diffusion_confidence_threshold``),
     defaulting to 0.9. Ignored by the other selection policies."""
 
